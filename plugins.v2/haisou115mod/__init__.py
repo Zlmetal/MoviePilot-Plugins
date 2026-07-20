@@ -106,7 +106,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -607,7 +607,8 @@ class HaiSou115Mod(_PluginBase):
 
             # 构建按钮（仅在支持按钮回调的渠道显示）
             buttons = []
-            if channel and channel.lower() in ["telegram", "slack"]:
+            channel_str = str(channel).lower() if channel else ""
+            if "telegram" in channel_str or "slack" in channel_str:
                 button_row = []
                 for i in range(1, min(len(items) + 1, 6)):
                     button_row.append({
@@ -710,7 +711,8 @@ class HaiSou115Mod(_PluginBase):
 
         # 构建确认按钮
         buttons = []
-        if channel and channel.lower() in ["telegram", "slack"]:
+        channel_str = str(channel).lower() if channel else ""
+        if "telegram" in channel_str or "slack" in channel_str:
             buttons = [
                 [
                     {
