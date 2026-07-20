@@ -106,7 +106,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -319,19 +319,25 @@ class HaiSou115Mod(_PluginBase):
                 },
             }
 
-            logger.info(f"[115海搜] 搜索关键词: {keyword}, 页码: {page}")
+            logger.info(f"[115海搜] 开始搜索, 关键词: {keyword}, 页码: {page}")
+
+            url = f"{self._haisou_base_url}/api/v2/shares/search"
+            logger.info(f"[115海搜] 请求URL: {url}")
+            logger.info(f"[115海搜] 请求参数: {payload}")
 
             resp = requests.post(
-                f"{self._haisou_base_url}/api/v2/shares/search",
+                url,
                 headers=headers,
                 json=payload,
                 timeout=60,
             )
 
-            logger.debug(f"[115海搜] 搜索响应: {resp.status_code}")
+            logger.info(f"[115海搜] 收到响应, 状态码: {resp.status_code}")
 
             if resp.status_code == 200:
                 data = resp.json()
+                logger.info(f"[115海搜] 响应成功字段: {data.get('success')}")
+
                 if data.get("success"):
                     items = data.get("data", {}).get("items", [])
                     pagination = data.get("data", {}).get("pagination", {})
@@ -343,11 +349,17 @@ class HaiSou115Mod(_PluginBase):
                     logger.warning(f"[115海搜] 搜索失败: {msg}")
                     return {"success": False, "msg": msg}
             else:
-                logger.error(f"[115海搜] 搜索请求失败: HTTP {resp.status_code}")
+                logger.error(f"[115海搜] 搜索请求失败: HTTP {resp.status_code}, 响应: {resp.text[:500]}")
                 return {"success": False, "msg": f"请求失败: HTTP {resp.status_code}"}
 
+        except requests.exceptions.Timeout:
+            logger.error(f"[115海搜] 搜索超时")
+            return {"success": False, "msg": "搜索超时，请稍后重试"}
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"[115海搜] 连接错误: {e}")
+            return {"success": False, "msg": f"连接失败: {str(e)}"}
         except Exception as e:
-            logger.error(f"[115海搜] 搜索异常: {e}")
+            logger.error(f"[115海搜] 搜索异常: {e}", exc_info=True)
             return {"success": False, "msg": f"搜索失败: {str(e)}"}
 
     def _get_share_detail(self, hsid: str) -> dict:
@@ -533,105 +545,117 @@ class HaiSou115Mod(_PluginBase):
 
     def _do_search_and_respond(self, keyword: str, channel, source, user, page: int = 1):
         """执行搜索并返回结果"""
-        # 发送搜索中提示
-        self.post_message(
-            channel=channel,
-            title="115海搜",
-            text=f"正在搜索: {keyword} ...",
-            userid=user,
-        )
-
-        # 执行搜索
-        result = self._search_resources(keyword, page=page)
-
-        if not result.get("success"):
+        try:
+            # 发送搜索中提示
             self.post_message(
                 channel=channel,
                 title="115海搜",
-                text=f"搜索失败: {result.get('msg', '未知错误')}",
+                text=f"正在搜索: {keyword} ...",
                 userid=user,
             )
-            return
 
-        items = result.get("items", [])
-        pagination = result.get("pagination", {})
+            # 执行搜索
+            logger.info(f"[115海搜] 调用搜索函数, keyword={keyword}, page={page}")
+            result = self._search_resources(keyword, page=page)
+            logger.info(f"[115海搜] 搜索函数返回: success={result.get('success')}, items_count={len(result.get('items', []))}")
 
-        if not items:
-            self.post_message(
-                channel=channel,
-                title="115海搜",
-                text=f"未找到与 '{keyword}' 相关的115资源",
-                userid=user,
-            )
-            return
+            if not result.get("success"):
+                self.post_message(
+                    channel=channel,
+                    title="115海搜",
+                    text=f"搜索失败: {result.get('msg', '未知错误')}",
+                    userid=user,
+                )
+                return
 
-        # 缓存搜索结果
-        cache_key = f"{user}_results"
-        self._search_cache[cache_key] = items
-        self._search_cache[f"{user}_keyword"] = keyword
+            items = result.get("items", [])
+            pagination = result.get("pagination", {})
 
-        # 格式化搜索结果
-        total = pagination.get("total", len(items))
-        result_text = f"搜索结果 (第{page}页，共{total}条):\n\n"
-        for i, item in enumerate(items, 1):
-            title = self._clean_html(item.get("share_name", "未知标题"))
-            size_bytes = item.get("stat_size", 0) or 0
-            file_count = item.get("stat_file", 0) or 0
-            share_code = item.get("share_code", "")
-            share_pwd = item.get("share_pwd", "")
+            if not items:
+                self.post_message(
+                    channel=channel,
+                    title="115海搜",
+                    text=f"未找到与 '{keyword}' 相关的115资源",
+                    userid=user,
+                )
+                return
 
-            size_str = self._format_size(size_bytes)
+            # 缓存搜索结果
+            cache_key = f"{user}_results"
+            self._search_cache[cache_key] = items
+            self._search_cache[f"{user}_keyword"] = keyword
 
-            result_text += f"{i}. {title}\n"
-            result_text += f"   大小: {size_str} | 文件数: {file_count}\n"
-            if share_pwd:
-                result_text += f"   提取码: {share_pwd}\n"
-            result_text += "\n"
+            # 格式化搜索结果
+            total = pagination.get("total", len(items))
+            result_text = f"搜索结果 (第{page}页，共{total}条):\n\n"
+            for i, item in enumerate(items, 1):
+                title = self._clean_html(item.get("share_name", "未知标题"))
+                size_bytes = item.get("stat_size", 0) or 0
+                file_count = item.get("stat_file", 0) or 0
+                share_code = item.get("share_code", "")
+                share_pwd = item.get("share_pwd", "")
 
-        result_text += "请回复数字选择要转存的资源 (如: 1)"
+                size_str = self._format_size(size_bytes)
 
-        # 构建按钮（仅在支持按钮回调的渠道显示）
-        buttons = []
-        if channel and channel.lower() in ["telegram", "slack"]:
-            button_row = []
-            for i in range(1, min(len(items) + 1, 6)):
-                button_row.append({
-                    "text": f"{i}",
-                    "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_select_{i}",
-                })
-                if len(button_row) == 3:
+                result_text += f"{i}. {title}\n"
+                result_text += f"   大小: {size_str} | 文件数: {file_count}\n"
+                if share_pwd:
+                    result_text += f"   提取码: {share_pwd}\n"
+                result_text += "\n"
+
+            result_text += "请回复数字选择要转存的资源 (如: 1)"
+
+            # 构建按钮（仅在支持按钮回调的渠道显示）
+            buttons = []
+            if channel and channel.lower() in ["telegram", "slack"]:
+                button_row = []
+                for i in range(1, min(len(items) + 1, 6)):
+                    button_row.append({
+                        "text": f"{i}",
+                        "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_select_{i}",
+                    })
+                    if len(button_row) == 3:
+                        buttons.append(button_row)
+                        button_row = []
+                if button_row:
                     buttons.append(button_row)
-                    button_row = []
-            if button_row:
-                buttons.append(button_row)
 
-            # 添加翻页和取消按钮
-            pagination_row = []
-            if page > 1:
+                # 添加翻页和取消按钮
+                pagination_row = []
+                if page > 1:
+                    pagination_row.append({
+                        "text": "上一页",
+                        "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_page_{page - 1}",
+                    })
+                has_next = pagination.get("has_next", False)
+                if has_next:
+                    pagination_row.append({
+                        "text": "下一页",
+                        "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_page_{page + 1}",
+                    })
                 pagination_row.append({
-                    "text": "上一页",
-                    "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_page_{page - 1}",
+                    "text": "取消",
+                    "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_cancel",
                 })
-            has_next = pagination.get("has_next", False)
-            if has_next:
-                pagination_row.append({
-                    "text": "下一页",
-                    "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_page_{page + 1}",
-                })
-            pagination_row.append({
-                "text": "取消",
-                "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_cancel",
-            })
-            if pagination_row:
-                buttons.append(pagination_row)
+                if pagination_row:
+                    buttons.append(pagination_row)
 
-        self.post_message(
-            channel=channel,
-            title="115海搜",
-            text=result_text,
-            userid=user,
-            buttons=buttons if buttons else None,
-        )
+            self.post_message(
+                channel=channel,
+                title="115海搜",
+                text=result_text,
+                userid=user,
+                buttons=buttons if buttons else None,
+            )
+
+        except Exception as e:
+            logger.error(f"[115海搜] 处理搜索结果异常: {e}", exc_info=True)
+            self.post_message(
+                channel=channel,
+                title="115海搜",
+                text=f"处理搜索结果时出错: {str(e)}",
+                userid=user,
+            )
 
     def _handle_select_result(self, index: int, channel, source, user):
         """处理用户选择搜索结果"""
