@@ -106,7 +106,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -450,17 +450,18 @@ class HaiSou115Mod(_PluginBase):
         # 提取搜索关键词 - 尝试多种方式
         keyword = ""
 
-        # 方式1: 直接从text中去掉命令前缀
-        if text:
-            keyword = text.replace("/hs", "").strip()
+        # 方式1: 从arg_str获取（MP命令参数的标准字段）
+        keyword = event_data.get("arg_str", "") or ""
 
-        # 方式2: 从event_data的其他字段获取
+        # 方式2: 直接从text中去掉命令前缀
         if not keyword:
-            keyword = event_data.get("keyword", "") or event_data.get("query", "") or event_data.get("content", "") or ""
+            text = event_data.get("text", "") or ""
+            if text:
+                keyword = text.replace("/hs", "").strip()
 
-        # 方式3: 从整个event_data中查找可能的关键词
+        # 方式3: 从event_data的其他字段获取
         if not keyword:
-            for key in ["message", "msg", "input", "search_keyword", "name", "title"]:
+            for key in ["keyword", "query", "content", "message", "msg", "input", "name", "title"]:
                 val = event_data.get(key, "")
                 if val and "/hs" not in str(val):
                     keyword = str(val).strip()
