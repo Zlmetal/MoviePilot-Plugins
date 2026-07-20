@@ -3,11 +3,12 @@
         "name": "115海搜转存",
         "description": "从海搜网站搜索115网盘资源，支持消息交互选择并自动转存",
         "labels": "云盘,工具",
-        "version": "1.0.7",
+        "version": "1.0.8",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
         "author": "Zlmetal",
         "level": 1,
         "history": {
+            "v1.0.8": "修复PluginManager获取插件实例方式",
             "v1.0.7": "直接调用p115strmhelper插件实例，不再通过HTTP API",
             "v1.0.6": "/hs select 直接转存，跳过确认步骤",
             "v1.0.5": "添加 /hs select 命令选择资源，避免智能体拦截",

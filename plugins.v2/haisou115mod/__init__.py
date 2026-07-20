@@ -107,7 +107,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本
-    plugin_version = "1.0.7"
+    plugin_version = "1.0.8"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -390,26 +390,31 @@ class HaiSou115Mod(_PluginBase):
     def _transfer_to_115(self, share_url: str, share_pwd: str, target_dir: str = "") -> dict:
         """调用p115strmhelper进行转存"""
         try:
-            # 尝试通过插件管理器获取p115strmhelper实例
+            # 通过PluginManager获取运行中的p115strmhelper实例
             from app.core.plugin import PluginManager
             pm = PluginManager()
-            p115_plugin = pm.get_plugin_instance("P115StrmHelper")
+            p115_plugin = pm._running_plugins.get("P115StrmHelper")
 
             if not p115_plugin:
                 logger.warning("[115海搜] P115StrmHelper插件未安装或未启用")
-                return {"code": -1, "msg": "P115StrmHelper插件未安装或未启用"}
+                return {"code": -1, "msg": "P115StrmHelper插件未安装或未启用，请先安装并启用115网盘STRM助手插件"}
 
             # 检查p115strmhelper是否有api属性
             if not hasattr(p115_plugin, 'api'):
                 logger.warning("[115海搜] P115StrmHelper插件API不可用")
                 return {"code": -1, "msg": "P115StrmHelper插件API不可用"}
 
-            logger.info(f"[115海搜] 调用p115strmhelper转存: {share_url}")
+            logger.info(f"[115海搜] 找到P115StrmHelper实例，开始转存: {share_url}")
 
             # 构造完整分享链接（包含密码）
             full_url = share_url
-            if share_pwd and "?password=" not in share_url:
-                full_url = f"{share_url}?password={share_pwd}"
+            if share_pwd and "password=" not in share_url:
+                if "?" in share_url:
+                    full_url = f"{share_url}&password={share_pwd}"
+                else:
+                    full_url = f"{share_url}?password={share_pwd}"
+
+            logger.info(f"[115海搜] 完整链接: {full_url}")
 
             # 调用p115strmhelper的add_transfer_share方法
             result = p115_plugin.api.add_transfer_share(
@@ -432,8 +437,8 @@ class HaiSou115Mod(_PluginBase):
                 return {"code": 0, "msg": str(result)}
 
         except ImportError as e:
-            logger.error(f"[115海搜] 导入p115strmhelper失败: {e}")
-            return {"code": -1, "msg": f"P115StrmHelper插件未安装: {str(e)}"}
+            logger.error(f"[115海搜] 导入失败: {e}")
+            return {"code": -1, "msg": f"依赖缺失: {str(e)}"}
         except Exception as e:
             logger.error(f"[115海搜] 调用p115strmhelper异常: {e}", exc_info=True)
             return {"code": -1, "msg": f"转存失败: {str(e)}"}
