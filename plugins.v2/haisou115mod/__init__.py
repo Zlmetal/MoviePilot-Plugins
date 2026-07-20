@@ -40,7 +40,7 @@ class HaiSouSearchTool:
         try:
             from app.core.plugin import PluginManager
             pm = PluginManager()
-            plugin = pm.get_plugin_instance("HaiSou115Mod")
+            plugin = pm._running_plugins.get("HaiSou115Mod")
             return plugin
         except Exception as e:
             logger.error(f"[115海搜] 获取插件实例失败: {e}")
@@ -107,7 +107,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
