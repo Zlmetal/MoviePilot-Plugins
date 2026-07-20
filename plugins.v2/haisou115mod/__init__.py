@@ -106,7 +106,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -443,12 +443,31 @@ class HaiSou115Mod(_PluginBase):
         channel = event_data.get("channel")
         source = event_data.get("source")
         user = event_data.get("user")
-        text = event_data.get("text", "")
+        text = event_data.get("text", "") or ""
 
-        logger.info(f"[115海搜] 收到搜索命令: {text}")
+        logger.info(f"[115海搜] 收到搜索命令, 原始text: '{text}', event_data keys: {list(event_data.keys())}")
 
-        # 提取搜索关键词（命令后面的文本）
-        keyword = text.replace("/hs", "").strip()
+        # 提取搜索关键词 - 尝试多种方式
+        keyword = ""
+
+        # 方式1: 直接从text中去掉命令前缀
+        if text:
+            keyword = text.replace("/hs", "").strip()
+
+        # 方式2: 从event_data的其他字段获取
+        if not keyword:
+            keyword = event_data.get("keyword", "") or event_data.get("query", "") or event_data.get("content", "") or ""
+
+        # 方式3: 从整个event_data中查找可能的关键词
+        if not keyword:
+            for key in ["message", "msg", "input", "search_keyword", "name", "title"]:
+                val = event_data.get(key, "")
+                if val and "/hs" not in str(val):
+                    keyword = str(val).strip()
+                    break
+
+        logger.info(f"[115海搜] 提取到的关键词: '{keyword}'")
+
         if not keyword:
             self.post_message(
                 channel=channel,
