@@ -1,13 +1,96 @@
 import re
 import time
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Type
 
 import requests
+from pydantic import BaseModel, Field
 
 from app.core.event import eventmanager, Event
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType
+
+
+# ==================== 智能体工具 ====================
+
+class HaiSouSearchInput(BaseModel):
+    """海搜搜索输入参数"""
+    keyword: str = Field(..., description="搜索关键词，如电影名、剧名等")
+    platform: str = Field(default="115", description="网盘平台，默认115")
+
+
+class HaiSouSearchTool:
+    """海搜115资源搜索工具 - 供MP智能体调用"""
+    name: str = "haisou_search"
+    description: str = (
+        "从海搜网站(haisou.cc)搜索115网盘资源。"
+        "当用户想要搜索电影、电视剧、动漫等影视资源的115网盘链接时使用此工具。"
+        "返回搜索结果包含标题、文件大小、文件数、分享链接和提取码。"
+    )
+    args_schema: Type[BaseModel] = HaiSouSearchInput
+
+    _session_id: Optional[str] = None
+    _user_id: Optional[str] = None
+    _channel: Optional[str] = None
+    _source: Optional[str] = None
+    _username: Optional[str] = None
+
+    def _get_plugin(self):
+        """通过PluginManager获取插件实例"""
+        try:
+            from app.core.plugin import PluginManager
+            pm = PluginManager()
+            plugin = pm.get_plugin_instance("HaiSou115Mod")
+            return plugin
+        except Exception as e:
+            logger.error(f"[115海搜] 获取插件实例失败: {e}")
+            return None
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        keyword = kwargs.get("keyword", "")
+        return f"正在从海搜搜索115资源: {keyword}"
+
+    async def run(self, keyword: str, platform: str = "115", **kwargs) -> str:
+        try:
+            plugin = self._get_plugin()
+            if not plugin:
+                return "插件未初始化，无法执行搜索"
+
+            result = plugin._search_resources(keyword, page=1, page_size=10)
+
+            if not result.get("success"):
+                return f"搜索失败: {result.get('msg', '未知错误')}"
+
+            items = result.get("items", [])
+            if not items:
+                return f"未找到与 '{keyword}' 相关的115网盘资源"
+
+            lines = [f"找到 {len(items)} 个115网盘资源:\n"]
+            for i, item in enumerate(items, 1):
+                title = plugin._clean_html(item.get("share_name", "未知"))
+                size_bytes = item.get("stat_size", 0) or 0
+                file_count = item.get("stat_file", 0) or 0
+                share_code = item.get("share_code", "")
+                share_pwd = item.get("share_pwd", "")
+
+                size_str = plugin._format_size(size_bytes)
+
+                share_url = f"https://115.com/s/{share_code}"
+                if share_pwd:
+                    share_url += f"?password={share_pwd}"
+
+                lines.append(f"{i}. {title}")
+                lines.append(f"   大小: {size_str} | 文件数: {file_count}")
+                lines.append(f"   链接: {share_url}")
+                if share_pwd:
+                    lines.append(f"   提取码: {share_pwd}")
+                lines.append("")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"[115海搜] 智能体搜索异常: {e}")
+            return f"搜索异常: {str(e)}"
 
 
 class HaiSou115Mod(_PluginBase):
@@ -162,6 +245,10 @@ class HaiSou115Mod(_PluginBase):
                 },
             },
         ]
+
+    def get_agent_tools(self) -> List[Type]:
+        """注册智能体工具"""
+        return [HaiSouSearchTool]
 
     def stop_service(self):
         """停用插件"""
