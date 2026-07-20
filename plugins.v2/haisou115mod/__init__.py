@@ -86,6 +86,7 @@ class HaiSouSearchTool:
                     lines.append(f"   提取码: {share_pwd}")
                 lines.append("")
 
+            lines.append("选择资源请使用命令: /hs select 序号 (如: /hs select 1)")
             return "\n".join(lines)
 
         except Exception as e:
@@ -106,7 +107,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -146,7 +147,7 @@ class HaiSou115Mod(_PluginBase):
             {
                 "cmd": "/hs",
                 "event": EventType.PluginAction,
-                "desc": "海搜115资源",
+                "desc": "海搜115资源 (格式: /hs 关键词 或 /hs select 序号)",
                 "category": "插件命令",
                 "data": {
                     "action": "haisou_search",
@@ -485,9 +486,24 @@ class HaiSou115Mod(_PluginBase):
             self.post_message(
                 channel=channel,
                 title="115海搜",
-                text="请输入搜索关键词，格式: /hs 电影名",
+                text="请输入搜索关键词，格式: /hs 电影名\n选择资源: /hs select 序号",
                 userid=user,
             )
+            return
+
+        # 处理选择命令: /hs select 1
+        if keyword.lower().startswith("select ") or keyword.lower().startswith("s "):
+            try:
+                index_str = keyword.split(None, 1)[1].strip()
+                index = int(index_str)
+                self._handle_select_result(index, channel, source, user)
+            except (ValueError, IndexError):
+                self.post_message(
+                    channel=channel,
+                    title="115海搜",
+                    text="序号无效，请输入数字，如: /hs select 1",
+                    userid=user,
+                )
             return
 
         # 执行搜索
@@ -603,7 +619,7 @@ class HaiSou115Mod(_PluginBase):
                     result_text += f"   提取码: {share_pwd}\n"
                 result_text += "\n"
 
-            result_text += "请回复数字选择要转存的资源 (如: 1)"
+            result_text += "选择资源: /hs select 序号 (如: /hs select 1)"
 
             # 构建按钮（仅在支持按钮回调的渠道显示）
             buttons = []
