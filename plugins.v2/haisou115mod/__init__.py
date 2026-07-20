@@ -107,7 +107,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -388,40 +388,54 @@ class HaiSou115Mod(_PluginBase):
             return {"success": False, "msg": f"获取失败: {str(e)}"}
 
     def _transfer_to_115(self, share_url: str, share_pwd: str, target_dir: str = "") -> dict:
-        """调用p115strmhelper的API进行转存"""
+        """调用p115strmhelper进行转存"""
         try:
-            from app.core.config import settings
+            # 尝试通过插件管理器获取p115strmhelper实例
+            from app.core.plugin import PluginManager
+            pm = PluginManager()
+            p115_plugin = pm.get_plugin_instance("P115StrmHelper")
 
-            base_url = f"http://127.0.0.1:{settings.PORT}"
-            api_key = settings.API_KEY
+            if not p115_plugin:
+                logger.warning("[115海搜] P115StrmHelper插件未安装或未启用")
+                return {"code": -1, "msg": "P115StrmHelper插件未安装或未启用"}
 
-            # 调用p115strmhelper的添加分享转存接口
-            params = {
-                "share_url": share_url,
-                "share_pwd": share_pwd,
-            }
-            if target_dir:
-                params["target_dir"] = target_dir
+            # 检查p115strmhelper是否有api属性
+            if not hasattr(p115_plugin, 'api'):
+                logger.warning("[115海搜] P115StrmHelper插件API不可用")
+                return {"code": -1, "msg": "P115StrmHelper插件API不可用"}
 
-            logger.info(f"[115海搜] 调用转存接口: {share_url}")
+            logger.info(f"[115海搜] 调用p115strmhelper转存: {share_url}")
 
-            resp = requests.get(
-                f"{base_url}/api/v1/plugin/P115StrmHelper/add_transfer_share",
-                headers={"Authorization": f"Bearer {api_key}"},
-                params=params,
-                timeout=60,
+            # 构造完整分享链接（包含密码）
+            full_url = share_url
+            if share_pwd and "?password=" not in share_url:
+                full_url = f"{share_url}?password={share_pwd}"
+
+            # 调用p115strmhelper的add_transfer_share方法
+            result = p115_plugin.api.add_transfer_share(
+                share_url=full_url,
+                pan_path=target_dir if target_dir else None
             )
 
-            if resp.status_code == 200:
-                result = resp.json()
-                logger.info(f"[115海搜] 转存结果: {result}")
+            logger.info(f"[115海搜] 转存结果: {result}")
+
+            # 转换结果为dict
+            if hasattr(result, '__dict__'):
+                return {
+                    "code": 0 if getattr(result, 'code', -1) == 0 else -1,
+                    "msg": getattr(result, 'msg', ''),
+                    "data": getattr(result, 'data', None)
+                }
+            elif isinstance(result, dict):
                 return result
             else:
-                logger.error(f"[115海搜] 转存请求失败: HTTP {resp.status_code}")
-                return {"code": -1, "msg": f"转存请求失败: HTTP {resp.status_code}"}
+                return {"code": 0, "msg": str(result)}
 
+        except ImportError as e:
+            logger.error(f"[115海搜] 导入p115strmhelper失败: {e}")
+            return {"code": -1, "msg": f"P115StrmHelper插件未安装: {str(e)}"}
         except Exception as e:
-            logger.error(f"[115海搜] 调用p115strmhelper转存异常: {e}")
+            logger.error(f"[115海搜] 调用p115strmhelper异常: {e}", exc_info=True)
             return {"code": -1, "msg": f"转存失败: {str(e)}"}
 
     def _format_size(self, size_bytes: int) -> str:
