@@ -107,7 +107,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -496,7 +496,7 @@ class HaiSou115Mod(_PluginBase):
             try:
                 index_str = keyword.split(None, 1)[1].strip()
                 index = int(index_str)
-                self._handle_select_result(index, channel, source, user)
+                self._handle_select_and_transfer(index, channel, source, user)
             except (ValueError, IndexError):
                 self.post_message(
                     channel=channel,
@@ -749,6 +749,74 @@ class HaiSou115Mod(_PluginBase):
             userid=user,
             buttons=buttons if buttons else None,
         )
+
+    def _handle_select_and_transfer(self, index: int, channel, source, user):
+        """选择资源并直接转存（跳过确认）"""
+        cache_key = f"{user}_results"
+        items = self._search_cache.get(cache_key, [])
+
+        if index < 1 or index > len(items):
+            self.post_message(
+                channel=channel,
+                title="115海搜",
+                text=f"无效的选择: {index}，请重新搜索",
+                userid=user,
+            )
+            return
+
+        item = items[index - 1]
+        title = self._clean_html(item.get("share_name", "未知标题"))
+        share_code = item.get("share_code", "")
+        share_pwd = item.get("share_pwd", "")
+
+        if not share_code:
+            self.post_message(
+                channel=channel,
+                title="115海搜",
+                text="未获取到有效的分享码",
+                userid=user,
+            )
+            return
+
+        # 构造115分享链接
+        share_url = f"https://115.com/s/{share_code}"
+        if share_pwd:
+            share_url += f"?password={share_pwd}"
+
+        # 发送转存中提示
+        self.post_message(
+            channel=channel,
+            title="115海搜",
+            text=f"正在转存: {title}\n链接: {share_url}",
+            userid=user,
+        )
+
+        # 调用转存
+        result = self._transfer_to_115(share_url, share_pwd)
+
+        # 检查转存结果
+        success = False
+        msg = ""
+        if isinstance(result, dict):
+            if result.get("code") == 0 or result.get("success"):
+                success = True
+            else:
+                msg = result.get("msg") or result.get("message") or result.get("error", {}).get("message", "未知错误")
+
+        if success:
+            self.post_message(
+                channel=channel,
+                title="115海搜",
+                text=f"转存成功!\n\n标题: {title}\n链接: {share_url}",
+                userid=user,
+            )
+        else:
+            self.post_message(
+                channel=channel,
+                title="115海搜",
+                text=f"转存失败: {msg or '未知错误'}\n\n请确认已安装并启用115网盘STRM助手插件",
+                userid=user,
+            )
 
     def _handle_confirm_transfer(self, cache_key: str, channel, source, user):
         """处理确认转存"""
