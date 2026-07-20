@@ -3,11 +3,12 @@
         "name": "115海搜转存",
         "description": "从海搜网站搜索115网盘资源，支持消息交互选择并自动转存。需要配合115网盘STRM助手(P115StrmHelper)插件使用",
         "labels": "云盘,工具",
-        "version": "1.0.9",
+        "version": "1.0.10",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
         "author": "Zlmetal",
         "level": 1,
         "history": {
+            "v1.0.10": "去掉搜索中提示，避免消息顺序混乱",
             "v1.0.9": "修复所有get_plugin_instance调用",
             "v1.0.8": "修复PluginManager获取插件实例方式",
             "v1.0.7": "直接调用p115strmhelper插件实例，不再通过HTTP API",

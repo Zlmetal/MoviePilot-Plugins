@@ -107,7 +107,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本
-    plugin_version = "1.0.9"
+    plugin_version = "1.0.10"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -581,15 +581,7 @@ class HaiSou115Mod(_PluginBase):
     def _do_search_and_respond(self, keyword: str, channel, source, user, page: int = 1):
         """执行搜索并返回结果"""
         try:
-            # 发送搜索中提示
-            self.post_message(
-                channel=channel,
-                title="115海搜",
-                text=f"正在搜索: {keyword} ...",
-                userid=user,
-            )
-
-            # 执行搜索
+            # 执行搜索（不发送"正在搜索"提示，避免与智能体消息顺序混乱）
             logger.info(f"[115海搜] 调用搜索函数, keyword={keyword}, page={page}")
             result = self._search_resources(keyword, page=page)
             logger.info(f"[115海搜] 搜索函数返回: success={result.get('success')}, items_count={len(result.get('items', []))}")
