@@ -103,7 +103,7 @@ class HaiSou115Mod(_PluginBase):
     # 插件名称
     plugin_name = "115海搜转存"
     # 插件描述
-    plugin_desc = "从海搜网站搜索115网盘资源，支持消息交互选择并自动转存"
+    plugin_desc = "从海搜网站搜索115网盘资源，支持消息交互选择并自动转存。需要配合115网盘STRM助手(P115StrmHelper)插件使用"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     # 插件版本

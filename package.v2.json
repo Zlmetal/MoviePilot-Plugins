@@ -1,7 +1,7 @@
 {
     "HaiSou115Mod": {
         "name": "115海搜转存",
-        "description": "从海搜网站搜索115网盘资源，支持消息交互选择并自动转存",
+        "description": "从海搜网站搜索115网盘资源，支持消息交互选择并自动转存。需要配合115网盘STRM助手(P115StrmHelper)插件使用",
         "labels": "云盘,工具",
         "version": "1.0.9",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
