@@ -1,8 +1,6 @@
-import json
 import re
 import time
 from typing import Any, Dict, List, Tuple, Optional
-from urllib.parse import urlencode
 
 import requests
 
@@ -52,6 +50,7 @@ class HaiSou115Mod(_PluginBase):
         config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._cookie = config.get("cookie") or ""
+        logger.info(f"[115海搜] 插件初始化完成，启用状态: {self._enabled}")
 
     def get_state(self) -> bool:
         """返回插件状态"""
@@ -130,7 +129,7 @@ class HaiSou115Mod(_PluginBase):
                                             "model": "cookie",
                                             "label": "海搜Cookie",
                                             "placeholder": "请粘贴从浏览器获取的海搜网站Cookie",
-                                            "hint": "登录haisou.cc后，从浏览器开发者工具中复制Cookie",
+                                            "hint": "登录haisou.cc后，从浏览器开发者工具中复制Cookie（留空也可用，有每日次数限制）",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -148,7 +147,7 @@ class HaiSou115Mod(_PluginBase):
     def get_page(self) -> List[dict]:
         """返回详情页JSON - 检查Cookie有效性"""
         cookie_valid = False
-        cookie_msg = "未配置Cookie"
+        cookie_msg = "未配置Cookie（匿名模式，有每日次数限制）"
 
         if self._cookie:
             cookie_valid, cookie_msg = self._check_cookie_valid()
@@ -157,7 +156,7 @@ class HaiSou115Mod(_PluginBase):
             {
                 "component": "VAlert",
                 "props": {
-                    "type": "success" if cookie_valid else "error",
+                    "type": "success" if cookie_valid else ("warning" if not self._cookie else "error"),
                     "variant": "tonal",
                     "text": f"Cookie状态: {cookie_msg}",
                 },
@@ -167,101 +166,126 @@ class HaiSou115Mod(_PluginBase):
     def stop_service(self):
         """停用插件"""
         self._search_cache.clear()
+        logger.info("[115海搜] 插件已停止")
 
     # ==================== 核心功能 ====================
 
     def _get_headers(self) -> dict:
         """获取请求头"""
-        return {
+        headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Referer": "https://haisou.cc/",
             "Origin": "https://haisou.cc",
-            "Cookie": self._cookie,
+            "Content-Type": "application/json",
         }
+        if self._cookie:
+            headers["Cookie"] = self._cookie
+        return headers
 
     def _check_cookie_valid(self) -> Tuple[bool, str]:
         """检查Cookie是否有效"""
         if not self._cookie:
-            return False, "未配置Cookie"
+            return False, "未配置Cookie（匿名模式，有每日次数限制）"
 
         try:
             headers = self._get_headers()
             resp = requests.get(
-                f"{self._haisou_base_url}/api/user/info",
+                f"{self._haisou_base_url}/api/v2/users/me",
                 headers=headers,
                 timeout=10,
             )
+            logger.debug(f"[115海搜] Cookie验证响应: {resp.status_code}")
+
             if resp.status_code == 200:
                 data = resp.json()
-                if data.get("code") == 0:
-                    user_info = data.get("result", {})
+                if data.get("success"):
+                    user_info = data.get("data", {})
                     username = user_info.get("username", "未知")
-                    membership = user_info.get("membership", "")
-                    return True, f"Cookie有效 - 用户: {username} {membership}"
+                    membership = user_info.get("membership_type", "")
+                    return True, f"Cookie有效 - 用户: {username} ({membership})"
                 else:
-                    return False, f"Cookie无效: {data.get('msg', '未知错误')}"
+                    error = data.get("error", {})
+                    return False, f"Cookie无效: {error.get('message', '未知错误')}"
             else:
                 return False, f"请求失败: HTTP {resp.status_code}"
         except Exception as e:
+            logger.error(f"[115海搜] Cookie验证异常: {e}")
             return False, f"验证失败: {str(e)}"
 
     def _search_resources(self, keyword: str, page: int = 1, page_size: int = 10) -> dict:
         """搜索海搜资源"""
-        if not self._cookie:
-            return {"code": -1, "msg": "未配置Cookie"}
-
         try:
             headers = self._get_headers()
 
-            # 海搜搜索参数
-            params = {
-                "keyword": keyword,
-                "platform": "115",
-                "page": page,
-                "pageSize": page_size,
+            # 海搜v2搜索参数 - scope必须是 "title" 或 "files"，不能用 "all"
+            payload = {
+                "query": keyword,
+                "filters": {
+                    "scope": "title",
+                    "platforms": ["115"],
+                },
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                },
             }
 
-            resp = requests.get(
-                f"{self._haisou_base_url}/api/search",
+            logger.info(f"[115海搜] 搜索关键词: {keyword}, 页码: {page}")
+
+            resp = requests.post(
+                f"{self._haisou_base_url}/api/v2/shares/search",
                 headers=headers,
-                params=params,
-                timeout=30,
+                json=payload,
+                timeout=60,
             )
 
+            logger.debug(f"[115海搜] 搜索响应: {resp.status_code}")
+
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                if data.get("success"):
+                    items = data.get("data", {}).get("items", [])
+                    pagination = data.get("data", {}).get("pagination", {})
+                    logger.info(f"[115海搜] 搜索成功，找到 {len(items)} 个结果")
+                    return {"success": True, "items": items, "pagination": pagination}
+                else:
+                    error = data.get("error", {})
+                    msg = error.get("message", "未知错误")
+                    logger.warning(f"[115海搜] 搜索失败: {msg}")
+                    return {"success": False, "msg": msg}
             else:
-                return {"code": -1, "msg": f"请求失败: HTTP {resp.status_code}"}
+                logger.error(f"[115海搜] 搜索请求失败: HTTP {resp.status_code}")
+                return {"success": False, "msg": f"请求失败: HTTP {resp.status_code}"}
 
         except Exception as e:
-            logger.error(f"海搜搜索失败: {str(e)}")
-            return {"code": -1, "msg": f"搜索失败: {str(e)}"}
+            logger.error(f"[115海搜] 搜索异常: {e}")
+            return {"success": False, "msg": f"搜索失败: {str(e)}"}
 
-    def _get_share_info(self, hsid: str) -> dict:
-        """获取分享链接和密码"""
-        if not self._cookie:
-            return {"code": -1, "msg": "未配置Cookie"}
-
+    def _get_share_detail(self, hsid: str) -> dict:
+        """获取分享详情"""
         try:
             headers = self._get_headers()
 
             resp = requests.get(
-                f"{self._haisou_base_url}/api/share/detail",
+                f"{self._haisou_base_url}/api/v2/shares/{hsid}",
                 headers=headers,
-                params={"hsid": hsid},
                 timeout=30,
             )
 
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                if data.get("success"):
+                    return {"success": True, "data": data.get("data", {})}
+                else:
+                    return {"success": False, "msg": data.get("error", {}).get("message", "获取失败")}
             else:
-                return {"code": -1, "msg": f"请求失败: HTTP {resp.status_code}"}
+                return {"success": False, "msg": f"请求失败: HTTP {resp.status_code}"}
 
         except Exception as e:
-            logger.error(f"获取分享信息失败: {str(e)}")
-            return {"code": -1, "msg": f"获取失败: {str(e)}"}
+            logger.error(f"[115海搜] 获取分享详情异常: {e}")
+            return {"success": False, "msg": f"获取失败: {str(e)}"}
 
     def _transfer_to_115(self, share_url: str, share_pwd: str, target_dir: str = "") -> dict:
         """调用p115strmhelper的API进行转存"""
@@ -279,6 +303,8 @@ class HaiSou115Mod(_PluginBase):
             if target_dir:
                 params["target_dir"] = target_dir
 
+            logger.info(f"[115海搜] 调用转存接口: {share_url}")
+
             resp = requests.get(
                 f"{base_url}/api/v1/plugin/P115StrmHelper/add_transfer_share",
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -287,16 +313,21 @@ class HaiSou115Mod(_PluginBase):
             )
 
             if resp.status_code == 200:
-                return resp.json()
+                result = resp.json()
+                logger.info(f"[115海搜] 转存结果: {result}")
+                return result
             else:
+                logger.error(f"[115海搜] 转存请求失败: HTTP {resp.status_code}")
                 return {"code": -1, "msg": f"转存请求失败: HTTP {resp.status_code}"}
 
         except Exception as e:
-            logger.error(f"调用p115strmhelper转存失败: {str(e)}")
+            logger.error(f"[115海搜] 调用p115strmhelper转存异常: {e}")
             return {"code": -1, "msg": f"转存失败: {str(e)}"}
 
     def _format_size(self, size_bytes: int) -> str:
         """格式化文件大小"""
+        if not size_bytes:
+            return "未知"
         if size_bytes >= 1024 * 1024 * 1024:
             return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
         elif size_bytes >= 1024 * 1024:
@@ -305,6 +336,12 @@ class HaiSou115Mod(_PluginBase):
             return f"{size_bytes / 1024:.2f} KB"
         else:
             return f"{size_bytes} B"
+
+    def _clean_html(self, text: str) -> str:
+        """清理HTML标签"""
+        if not text:
+            return "未知标题"
+        return re.sub(r'<[^>]+>', '', text)
 
     # ==================== 消息交互 ====================
 
@@ -320,6 +357,8 @@ class HaiSou115Mod(_PluginBase):
         source = event_data.get("source")
         user = event_data.get("user")
         text = event_data.get("text", "")
+
+        logger.info(f"[115海搜] 收到搜索命令: {text}")
 
         # 提取搜索关键词（命令后面的文本）
         keyword = text.replace("/hs", "").strip()
@@ -352,27 +391,30 @@ class HaiSou115Mod(_PluginBase):
         source = event_data.get("source")
         userid = event_data.get("userid")
 
+        logger.info(f"[115海搜] 收到回调: {text}")
+
         # 处理不同的回调
         if text.startswith("hs_select_"):
             # 用户选择了某个搜索结果
             try:
                 index = int(text.replace("hs_select_", ""))
                 self._handle_select_result(index, channel, source, userid)
-            except (ValueError, IndexError):
-                pass
+            except (ValueError, IndexError) as e:
+                logger.error(f"[115海搜] 处理选择回调异常: {e}")
         elif text.startswith("hs_confirm_"):
             # 用户确认转存
-            hsid = text.replace("hs_confirm_", "")
-            self._handle_confirm_transfer(hsid, channel, source, userid)
+            cache_key = text.replace("hs_confirm_", "")
+            self._handle_confirm_transfer(cache_key, channel, source, userid)
         elif text.startswith("hs_page_"):
             # 翻页
             try:
                 page = int(text.replace("hs_page_", ""))
-                keyword = self._search_cache.get(f"{userid}_keyword", "")
+                cache_key = f"{userid}_keyword"
+                keyword = self._search_cache.get(cache_key, "")
                 if keyword:
                     self._do_search_and_respond(keyword, channel, source, userid, page)
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as e:
+                logger.error(f"[115海搜] 处理翻页回调异常: {e}")
         elif text == "hs_cancel":
             # 取消操作
             self.post_message(
@@ -395,7 +437,7 @@ class HaiSou115Mod(_PluginBase):
         # 执行搜索
         result = self._search_resources(keyword, page=page)
 
-        if result.get("code") != 0:
+        if not result.get("success"):
             self.post_message(
                 channel=channel,
                 title="115海搜",
@@ -404,7 +446,9 @@ class HaiSou115Mod(_PluginBase):
             )
             return
 
-        items = result.get("result", {}).get("items", [])
+        items = result.get("items", [])
+        pagination = result.get("pagination", {})
+
         if not items:
             self.post_message(
                 channel=channel,
@@ -420,56 +464,66 @@ class HaiSou115Mod(_PluginBase):
         self._search_cache[f"{user}_keyword"] = keyword
 
         # 格式化搜索结果
-        result_text = f"搜索结果 (第{page}页):\n\n"
+        total = pagination.get("total", len(items))
+        result_text = f"搜索结果 (第{page}页，共{total}条):\n\n"
         for i, item in enumerate(items, 1):
-            title = item.get("title", "未知标题")
-            size_bytes = item.get("sizeBytes", 0) or item.get("size", 0) or 0
-            file_count = item.get("fileCount", 0) or item.get("file_count", 0) or 0
+            title = self._clean_html(item.get("share_name", "未知标题"))
+            size_bytes = item.get("stat_size", 0) or 0
+            file_count = item.get("stat_file", 0) or 0
+            share_code = item.get("share_code", "")
+            share_pwd = item.get("share_pwd", "")
 
             size_str = self._format_size(size_bytes)
 
             result_text += f"{i}. {title}\n"
-            result_text += f"   大小: {size_str} | 文件数: {file_count}\n\n"
+            result_text += f"   大小: {size_str} | 文件数: {file_count}\n"
+            if share_pwd:
+                result_text += f"   提取码: {share_pwd}\n"
+            result_text += "\n"
 
         result_text += "请回复数字选择要转存的资源 (如: 1)"
 
-        # 构建按钮
+        # 构建按钮（仅在支持按钮回调的渠道显示）
         buttons = []
-        button_row = []
-        for i in range(1, min(len(items) + 1, 6)):
-            button_row.append({
-                "text": f"{i}",
-                "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_select_{i}",
-            })
-            if len(button_row) == 3:
+        if channel and channel.lower() in ["telegram", "slack"]:
+            button_row = []
+            for i in range(1, min(len(items) + 1, 6)):
+                button_row.append({
+                    "text": f"{i}",
+                    "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_select_{i}",
+                })
+                if len(button_row) == 3:
+                    buttons.append(button_row)
+                    button_row = []
+            if button_row:
                 buttons.append(button_row)
-                button_row = []
-        if button_row:
-            buttons.append(button_row)
 
-        # 添加翻页和取消按钮
-        pagination_row = []
-        if page > 1:
+            # 添加翻页和取消按钮
+            pagination_row = []
+            if page > 1:
+                pagination_row.append({
+                    "text": "上一页",
+                    "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_page_{page - 1}",
+                })
+            has_next = pagination.get("has_next", False)
+            if has_next:
+                pagination_row.append({
+                    "text": "下一页",
+                    "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_page_{page + 1}",
+                })
             pagination_row.append({
-                "text": "上一页",
-                "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_page_{page - 1}",
+                "text": "取消",
+                "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_cancel",
             })
-        pagination_row.append({
-            "text": "下一页",
-            "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_page_{page + 1}",
-        })
-        pagination_row.append({
-            "text": "取消",
-            "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_cancel",
-        })
-        buttons.append(pagination_row)
+            if pagination_row:
+                buttons.append(pagination_row)
 
         self.post_message(
             channel=channel,
             title="115海搜",
             text=result_text,
             userid=user,
-            buttons=buttons,
+            buttons=buttons if buttons else None,
         )
 
     def _handle_select_result(self, index: int, channel, source, user):
@@ -487,81 +541,69 @@ class HaiSou115Mod(_PluginBase):
             return
 
         item = items[index - 1]
-        title = item.get("title", "未知标题")
+        title = self._clean_html(item.get("share_name", "未知标题"))
+        share_code = item.get("share_code", "")
+        share_pwd = item.get("share_pwd", "")
         hsid = item.get("hsid", "")
 
-        # 发送获取中提示
-        self.post_message(
-            channel=channel,
-            title="115海搜",
-            text=f"正在获取分享信息: {title} ...",
-            userid=user,
-        )
-
-        # 获取分享信息
-        share_result = self._get_share_info(hsid)
-
-        if share_result.get("code") != 0:
+        if not share_code:
             self.post_message(
                 channel=channel,
                 title="115海搜",
-                text=f"获取分享信息失败: {share_result.get('msg', '未知错误')}",
+                text="未获取到有效的分享码",
                 userid=user,
             )
             return
 
-        share_info = share_result.get("result", {})
-        share_url = share_info.get("shareUrl", "")
-        share_pwd = share_info.get("sharePwd", "")
-
-        if not share_url:
-            self.post_message(
-                channel=channel,
-                title="115海搜",
-                text="未获取到有效的分享链接",
-                userid=user,
-            )
-            return
+        # 构造115分享链接
+        share_url = f"https://115.com/s/{share_code}"
+        if share_pwd:
+            share_url += f"?password={share_pwd}"
 
         # 发送确认信息
         confirm_text = f"即将转存:\n\n"
         confirm_text += f"标题: {title}\n"
         confirm_text += f"链接: {share_url}\n"
         if share_pwd:
-            confirm_text += f"密码: {share_pwd}\n"
+            confirm_text += f"提取码: {share_pwd}\n"
         confirm_text += f"\n确认转存?"
 
-        buttons = [
-            [
-                {
-                    "text": "确认转存",
-                    "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_confirm_{hsid}",
-                },
-                {
-                    "text": "取消",
-                    "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_cancel",
-                },
-            ]
-        ]
-
         # 缓存分享信息
-        self._search_cache[f"{user}_share_{hsid}"] = {
+        cache_key = f"{user}_share_{hsid}"
+        self._search_cache[cache_key] = {
             "share_url": share_url,
             "share_pwd": share_pwd,
             "title": title,
+            "hsid": hsid,
         }
+
+        # 构建确认按钮
+        buttons = []
+        if channel and channel.lower() in ["telegram", "slack"]:
+            buttons = [
+                [
+                    {
+                        "text": "确认转存",
+                        "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_confirm_{hsid}",
+                    },
+                    {
+                        "text": "取消",
+                        "callback_data": f"[PLUGIN]{self.__class__.__name__}|hs_cancel",
+                    },
+                ]
+            ]
 
         self.post_message(
             channel=channel,
             title="115海搜",
             text=confirm_text,
             userid=user,
-            buttons=buttons,
+            buttons=buttons if buttons else None,
         )
 
-    def _handle_confirm_transfer(self, hsid: str, channel, source, user):
+    def _handle_confirm_transfer(self, cache_key: str, channel, source, user):
         """处理确认转存"""
-        share_data = self._search_cache.get(f"{user}_share_{hsid}", {})
+        share_data = self._search_cache.get(f"{user}_share_{cache_key}", {})
 
         if not share_data:
             self.post_message(
@@ -587,7 +629,16 @@ class HaiSou115Mod(_PluginBase):
         # 调用转存
         result = self._transfer_to_115(share_url, share_pwd)
 
-        if result.get("code") == 0:
+        # 检查转存结果
+        success = False
+        msg = ""
+        if isinstance(result, dict):
+            if result.get("code") == 0 or result.get("success"):
+                success = True
+            else:
+                msg = result.get("msg") or result.get("message") or result.get("error", {}).get("message", "未知错误")
+
+        if success:
             self.post_message(
                 channel=channel,
                 title="115海搜",
@@ -598,12 +649,12 @@ class HaiSou115Mod(_PluginBase):
             self.post_message(
                 channel=channel,
                 title="115海搜",
-                text=f"转存失败: {result.get('msg', '未知错误')}",
+                text=f"转存失败: {msg or '未知错误'}\n\n请确认已安装并启用115网盘STRM助手插件",
                 userid=user,
             )
 
         # 清理缓存
-        self._search_cache.pop(f"{user}_share_{hsid}", None)
+        self._search_cache.pop(f"{user}_share_{cache_key}", None)
 
     # ==================== API接口 ====================
 
