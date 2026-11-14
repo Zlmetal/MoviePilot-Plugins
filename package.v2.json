@@ -20,5 +20,17 @@
             "v1.0.1": "修复智能体触发命令时关键词提取失败的问题",
             "v1.0.0": "初始版本，支持海搜115资源搜索、消息交互选择、自动转存"
         }
+    },
+    "DynamicWeChatQQPatch": {
+        "name": "动态企微QQ通知补丁",
+        "description": "把「动态企微可信IP」(DynamicWeChat) 的通知通道从微信改到 QQ Bot，复用 MoviePilot 已配置的 QQ 渠道。运行时替换，不修改原插件文件",
+        "labels": "工具,通知",
+        "version": "1.0.0",
+        "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/QQ_A.png",
+        "author": "Zlmetal",
+        "level": 1,
+        "history": {
+            "v1.0.0": "初始版本，接管 DynamicWeChat 的 _send_v2_wechat，把通知渠道切到 QQ"
+        }
     }
 }
