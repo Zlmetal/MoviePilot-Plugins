@@ -1,36 +1,37 @@
 {
-    "HaiSou115Mod": {
-        "name": "115海搜转存",
-        "description": "从海搜网站搜索115网盘资源，支持消息交互选择并自动转存。需要配合115网盘STRM助手(P115StrmHelper)插件使用",
-        "labels": "云盘,工具",
-        "version": "1.0.10",
-        "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
-        "author": "Zlmetal",
-        "level": 1,
-        "history": {
-            "v1.0.10": "去掉搜索中提示，避免消息顺序混乱",
-            "v1.0.9": "修复所有get_plugin_instance调用",
-            "v1.0.8": "修复PluginManager获取插件实例方式",
-            "v1.0.7": "直接调用p115strmhelper插件实例，不再通过HTTP API",
-            "v1.0.6": "/hs select 直接转存，跳过确认步骤",
-            "v1.0.5": "添加 /hs select 命令选择资源，避免智能体拦截",
-            "v1.0.4": "修复MessageChannel对象无法调用lower方法的问题",
-            "v1.0.3": "添加详细日志，修复搜索结果处理异常",
-            "v1.0.2": "修复关键词从arg_str字段提取",
-            "v1.0.1": "修复智能体触发命令时关键词提取失败的问题",
-            "v1.0.0": "初始版本，支持海搜115资源搜索、消息交互选择、自动转存"
-        }
-    },
-    "DynamicWeChatQQPatch": {
-        "name": "动态企微QQ通知补丁",
-        "description": "把「动态企微可信IP」(DynamicWeChat) 的通知通道从微信改到 QQ Bot，复用 MoviePilot 已配置的 QQ 渠道。运行时替换，不修改原插件文件",
-        "labels": "工具,通知",
-        "version": "1.0.0",
-        "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/QQ_A.png",
-        "author": "Zlmetal",
-        "level": 1,
-        "history": {
-            "v1.0.0": "初始版本，接管 DynamicWeChat 的 _send_v2_wechat，把通知渠道切到 QQ"
-        }
+  "HaiSou115Mod": {
+    "name": "115海搜转存",
+    "description": "从海搜网站搜索115网盘资源，支持消息交互选择并自动转存。需要配合115网盘STRM助手(P115StrmHelper)插件使用",
+    "labels": "云盘,工具",
+    "version": "1.0.10",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
+    "author": "Zlmetal",
+    "level": 1,
+    "history": {
+      "v1.0.10": "去掉搜索中提示，避免消息顺序混乱",
+      "v1.0.9": "修复所有get_plugin_instance调用",
+      "v1.0.8": "修复PluginManager获取插件实例方式",
+      "v1.0.7": "直接调用p115strmhelper插件实例，不再通过HTTP API",
+      "v1.0.6": "/hs select 直接转存，跳过确认步骤",
+      "v1.0.5": "添加 /hs select 命令选择资源，避免智能体拦截",
+      "v1.0.4": "修复MessageChannel对象无法调用lower方法的问题",
+      "v1.0.3": "添加详细日志，修复搜索结果处理异常",
+      "v1.0.2": "修复关键词从arg_str字段提取",
+      "v1.0.1": "修复智能体触发命令时关键词提取失败的问题",
+      "v1.0.0": "初始版本，支持海搜115资源搜索、消息交互选择、自动转存"
     }
+  },
+  "DynamicWeChatQQPatch": {
+    "name": "动态企微QQ通知补丁",
+    "description": "把「动态企微可信IP」(DynamicWeChat) 的通知通道从微信改到 QQ Bot，复用 MoviePilot 已配置的 QQ 渠道。运行时替换，不修改原插件文件",
+    "labels": "工具,通知",
+    "version": "1.0.1",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/QQ_A.png",
+    "author": "Zlmetal",
+    "level": 1,
+    "history": {
+      "v1.0.1": "修复未实现 stop_service 导致插件实例无法创建（数据/配置加载失败）",
+      "v1.0.0": "初始版本，接管 DynamicWeChat 的 _send_v2_wechat，把通知渠道切到 QQ"
+    }
+  }
 }

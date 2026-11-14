@@ -63,7 +63,7 @@ class DynamicWeChatQQPatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/QQ_A.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -96,6 +96,11 @@ class DynamicWeChatQQPatch(_PluginBase):
     def get_state(self) -> bool:
         """返回插件状态"""
         return self._enabled
+
+    def stop_service(self):
+        """停止插件（MP 基类的抽象方法，必须实现）：还原补丁"""
+        self._enabled = False
+        self._restore_patch()
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
