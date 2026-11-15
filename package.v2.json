@@ -33,5 +33,17 @@
       "v1.0.1": "修复未实现 stop_service 导致插件实例无法创建（数据/配置加载失败）",
       "v1.0.0": "初始版本，接管 DynamicWeChat 的 _send_v2_wechat，把通知渠道切到 QQ"
     }
+  },
+  "CloudSubscribePatch": {
+    "name": "网盘订阅智能下载补丁",
+    "description": "为「网盘订阅助手」补上智能下载策略：PT 首发资源先拦下不下载，让网盘渠道在可配置的等待窗口内监控并择优，窗口到期仍无合适资源再回归 PT 搜索下载。不修改原插件任何文件",
+    "labels": "工具,云盘",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
+    "author": "Zlmetal",
+    "level": 1,
+    "history": {
+      "v1.0.0": "初始版本：PT 资源拦截开窗、网盘定时巡检打分择优、到期提交或回归 PT"
+    }
   }
 }
