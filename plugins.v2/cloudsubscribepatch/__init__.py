@@ -70,12 +70,23 @@ _CHAIN_PRIORITY = 1
 _SHARE_CHECK_TTL = 6 * 60 * 60   # 同一链接 6 小时内不重复校验
 _SHARE_CHECK_BUDGET = 5          # 单次巡检最多校验 5 个链接（115 有 QPS 限制）
 
+# 提交 + 等同步链回结果可能要几十秒到几分钟；这段时间用 submitting_at
+# 压住重复提交，超时视为线程已死，允许重来。
+_SUBMIT_STALE_SECONDS = 2 * 60 * 60
+
 # 链接寿命：pansou 这类聚合源给的都是别人转发的第三方分享，24 小时内
 # 常被取消；dian115 解锁出来的链接、平台自有链接要持久得多。
 # 排序时把「短效直链」压到「需解锁网盘」后面——宁可花一次积分等个稳的，
 # 也别好不容等到期才发现链接早被人删了。
 _FRAGILE_SOURCES = frozenset({"pansou"})
 _FRAGILE_RANK = 1.9              # 落在「需解锁网盘(1)」与「PT(2)」之间的档位
+
+# 提交后确认：网盘订阅助手的 start_selected_resources 只是把候选塞进队列就
+# 返回 success，真正的转存失败（分享在提交瞬间被人取消）发生在几十秒之后。
+# 所以提交改走 sync_subscribes 同步跑完，用真实转存数判断成败；
+# 全失败时隔一会儿再来一轮，别把窗口一关了事。
+_SUBMIT_MAX_ATTEMPTS = 3         # 同一窗口最多连续尝试几轮
+_SUBMIT_RETRY_DELAY = 30 * 60    # 一轮候选全失败后隔多久再试
 
 # 画质/来源排序权重（数值越大越好）
 _RESOLUTION_SCORE = {"4K": 40, "1080P": 25, "720P": 10}
@@ -160,7 +171,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -704,13 +715,8 @@ class CloudSubscribePatch(_PluginBase):
                         f"【网盘订阅智能下载补丁】{window.get('name')} 窗口到期，"
                         f"改用网盘候选并拦下 PT：{title}"
                     )
-                    # 提交动作放到线程里，别卡住下载链
-                    threading.Thread(
-                        target=self._submit_best,
-                        args=(window, cloud),
-                        daemon=True,
-                        name="cloudsubscribe-patch-submit",
-                    ).start()
+                    # 提交动作由 _submit_best 自己起线程，别卡住下载链
+                    self._submit_best(window, cloud)
                     return
                 # 没有任何网盘候选 → 放行 PT
                 logger.info(
@@ -864,9 +870,10 @@ class CloudSubscribePatch(_PluginBase):
         self._trigger_pt_search(int(window.get("sid") or 0), str(name))
 
     def _submit_best(self, window: Dict[str, Any], cloud: Any) -> bool:
-        """提交最优候选；需解锁的资源只有排到这里才会真正花积分解锁。
+        """挑出要先试的候选并起线程去提交、等同步链回真实结果。
 
-        解锁失败（积分不足/节点失效）时顺位尝试备选，避免整窗白等。
+        返回 True 表示「已经有人接手」，调用方不要再关窗或回归 PT——
+        真正的成败由提交线程拿到同步链结果后再定。
         """
         name = window.get("name") or window.get("sid")
         ranked = window.get("ranked") or []
@@ -883,73 +890,187 @@ class CloudSubscribePatch(_PluginBase):
             )
             return False
 
+        sid = int(window.get("sid") or 0)
+        key = str(sid)
+        now = time.time()
+        with self._lock:
+            current = self._windows.get(key) or {}
+            started = float(current.get("submitting_at") or 0)
+            if started and now - started < _SUBMIT_STALE_SECONDS:
+                logger.info(
+                    f"【网盘订阅智能下载补丁】{name} 已有提交任务在跑，跳过重复提交"
+                )
+                return True
+            current["submitting_at"] = now
+            self._windows[key] = current
+            self._persist()
+
+        threading.Thread(
+            target=self._submit_worker,
+            args=(dict(window), cloud, list(ranked), str(name), sid),
+            daemon=True,
+            name="cloudsubscribe-patch-submit",
+        ).start()
+        return True
+
+    def _submit_worker(
+            self, window: Dict[str, Any], cloud: Any,
+            ranked: List[Dict[str, Any]], name: str, sid: int
+    ) -> None:
+        """按名次依次提交，直到同步链确认真的转存成功；全失败再决定要不要回归 PT。"""
+        key = str(sid)
         service = self._share_transfer_service(cloud)
-        for index, best in enumerate(ranked):
-            resource = best.get("resource") or {}
-            if not resource:
-                continue
-            # 等待期内分享可能已被取消，提交前再确认一次，别把死链交给同步链
-            url = str(resource.get("url") or "").strip()
-            if url and service:
-                if self._check_share_alive(service, url, name) is False:
-                    logger.info(
-                        f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名链接已失效，顺位下一个"
-                    )
-                    continue
-            tier = best.get("tier")
-            if tier is None:
-                tier = self._candidate_tier(resource)
-            if int(tier) >= 2:
-                # 磁力/PT 类候选不交给网盘链：PT 本来就能直接下，没必要再经离线拖一遍
-                logger.info(
-                    f"【网盘订阅智能下载补丁】{name} 跳过第 {index + 1} 名"
-                    f"（{best.get('tier_text') or 'PT'}），保留 PT 直下更省事"
-                )
-                continue
-            if best.get("need_unlock"):
-                logger.info(
-                    f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名需解锁"
-                    f"（{best.get('unlock_points') or 0} 积分），开始解锁：{best.get('title')}"
-                )
-            elif best.get("need_access"):
-                logger.info(
-                    f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名免费待领取，"
-                    f"开始获取链接：{best.get('title')}"
-                )
-                # start_selected_resources 只认 need_unlock+resource_ref，
-                # 免费待领取的候选得先在这里领一次，把 url 补上再交出去
-                resource = self._claim_free_resource(cloud, best, name)
+        try:
+            for index, best in enumerate(ranked):
+                resource = dict(best.get("resource") or {})
                 if not resource:
                     continue
-            try:
-                result = cloud.start_selected_resources(int(window.get("sid") or 0), [resource])
-            except Exception as error:
-                logger.error(f"【网盘订阅智能下载补丁】提交候选失败：{error}")
-                continue
-            if not (isinstance(result, dict) and result.get("success")):
-                logger.warning(
-                    f"【网盘订阅智能下载补丁】候选 {index + 1} 提交未成功：{result}"
+                # 等待期内分享可能已被取消，提交前强制重查一次（不吃 6 小时缓存）
+                url = str(resource.get("url") or "").strip()
+                if url and service:
+                    if self._check_share_alive(service, url, name, force=True) is False:
+                        logger.info(
+                            f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名链接已失效，顺位下一个"
+                        )
+                        continue
+                tier = best.get("tier")
+                if tier is None:
+                    tier = self._candidate_tier(resource)
+                if int(tier) >= 2:
+                    # 磁力/PT 类候选不交给网盘链：PT 本来就能直接下
+                    logger.info(
+                        f"【网盘订阅智能下载补丁】{name} 跳过第 {index + 1} 名"
+                        f"（{best.get('tier_text') or 'PT'}），保留 PT 直下更省事"
+                    )
+                    continue
+                if best.get("need_unlock"):
+                    logger.info(
+                        f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名需解锁"
+                        f"（{best.get('unlock_points') or 0} 积分），开始解锁：{best.get('title')}"
+                    )
+                elif best.get("need_access"):
+                    logger.info(
+                        f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名免费待领取，"
+                        f"开始获取链接：{best.get('title')}"
+                    )
+                    # 免费待领取的候选得先在这里领一次，把 url 补上再交出去
+                    claimed = self._claim_free_resource(cloud, best, name)
+                    if not claimed:
+                        continue
+                    resource = claimed
+                success, detail = self._transfer_and_confirm(cloud, sid, resource, name)
+                if not success:
+                    logger.warning(
+                        f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名转存未成功"
+                        f"（{detail}），顺位下一个：{best.get('title')}"
+                    )
+                    continue
+                logger.info(
+                    f"【网盘订阅智能下载补丁】{name} 已确认转存：{best.get('title')}"
                 )
-                continue
-            logger.info(
-                f"【网盘订阅智能下载补丁】{name} 已提交网盘资源：{best.get('title')}"
+                self._close_window(key)
+                if self._notify:
+                    self.post_message(
+                        mtype="订阅",
+                        title="【智能下载】已选用网盘资源",
+                        text=(
+                            f"{name}\n"
+                            f"资源：{best.get('title')}\n"
+                            f"来源：{best.get('source') or '网盘'}"
+                            f"（{best.get('tier_text') or ''}）\n"
+                            f"评分：{best.get('score')}\n"
+                            f"文件大小：{best.get('size_text') or '未知'}\n"
+                            f"状态：{detail or '已转存'}"
+                        ),
+                    )
+                return
+            self._all_candidates_failed(key, name, sid)
+        except Exception as error:
+            logger.error(f"【网盘订阅智能下载补丁】{name} 提交线程异常：{error}")
+            # 异常也要收尾，否则窗口每轮巡检都会重试同一个坏候选
+            self._all_candidates_failed(key, name, sid)
+        finally:
+            with self._lock:
+                current = self._windows.get(key)
+                if current is not None:
+                    current.pop("submitting_at", None)
+                    self._persist()
+
+    def _transfer_and_confirm(
+            self, cloud: Any, sid: int,
+            resource: Dict[str, Any], name: str
+    ) -> Tuple[bool, str]:
+        """把候选交给同步链并等它回来，用真实转存数判定成败。
+
+        原插件的 `start_selected_resources` 只是把任务丢进线程池，
+        它返回的 success 只代表「入队成功」——之前正是这样把死链当成功，
+        通知发了、窗口关了，实际转存 0 个文件。这里改成同步等结果。
+        """
+        if sid <= 0:
+            return False, "订阅 ID 无效"
+        sync = getattr(cloud, "sync_subscribes", None)
+        if not callable(sync):
+            return False, "网盘订阅助手版本不支持同步执行，无法确认结果"
+        snapshot: Dict[str, Any] = {}
+        try:
+            sync(
+                subscribe_id=sid,
+                manual_resources=[resource],
+                result=snapshot,
+                wait_for_slot=True,
             )
-            self._close_window(str(window.get("sid")))
-            if self._notify:
-                self.post_message(
-                    mtype="订阅",
-                    title="【智能下载】已选用网盘资源",
-                    text=(
-                        f"{name}\n"
-                        f"资源：{best.get('title')}\n"
-                        f"来源：{best.get('source') or '网盘'}"
-                        f"（{best.get('tier_text') or ''}）\n"
-                        f"评分：{best.get('score')}\n"
-                        f"文件大小：{best.get('size_text') or '未知'}"
-                    ),
-                )
-            return True
-        return False
+        except Exception as error:
+            return False, f"调用同步链异常：{error}"
+        if not isinstance(snapshot, dict) or not snapshot:
+            return False, "同步链没有返回执行结果"
+        message = str(snapshot.get("message") or "").strip()
+        data = snapshot.get("data") or {}
+        try:
+            transferred = int(data.get("transferred") or 0)
+        except (TypeError, ValueError):
+            transferred = 0
+        if not snapshot.get("success"):
+            return False, message or "同步链执行失败"
+        if transferred > 0:
+            return True, f"已转存 {transferred} 个文件"
+        # 网盘文件先入离线/待就绪队列也属于成功，真正下载由网盘自己慢慢来
+        if "已提交" in message and (
+                "等待就绪" in message or "等待下载" in message or "网盘任务" in message
+        ):
+            return True, message
+        return False, message or "未转存任何文件"
+
+    def _all_candidates_failed(self, key: str, name: str, sid: int) -> None:
+        """候选全部转存失败：窗口还有时间就清空候选等下一轮，没时间就回归 PT。"""
+        now = time.time()
+        with self._lock:
+            window = self._windows.get(key) or {}
+            expire_at = float(window.get("expire_at") or 0)
+            if window and now < expire_at:
+                window["best"] = None
+                window["ranked"] = []
+                self._windows[key] = window
+                self._persist()
+            else:
+                window = {}
+        if window:
+            logger.info(
+                f"【网盘订阅智能下载补丁】{name} 候选全部转存失败，"
+                f"窗口内继续等待新的网盘资源"
+            )
+            return
+        self._close_window(key)
+        if self._notify:
+            self.post_message(
+                mtype="订阅",
+                title="【智能下载】网盘候选转存失败，回归 PT",
+                text=(
+                    f"{name}\n"
+                    f"窗口内找到的网盘候选要么链接失效、要么转存 0 个文件，"
+                    f"已放弃网盘渠道并重新触发 PT 搜索下载。"
+                ),
+            )
+        self._trigger_pt_search(sid, name)
 
     def _claim_free_resource(
             self, cloud: Any, best: Dict[str, Any], name: str
@@ -1144,15 +1265,20 @@ class CloudSubscribePatch(_PluginBase):
         return None
 
     def _check_share_alive(
-            self, service: Any, share_url: str, name: str = ""
+            self, service: Any, share_url: str, name: str = "",
+            force: bool = False
     ) -> Optional[bool]:
-        """查一个分享链接还在不在：True 有效 / False 失效 / None 查不了。"""
+        """查一个分享链接还在不在：True 有效 / False 失效 / None 查不了。
+
+        `force=True` 时不吃缓存——巡检留存的那份「有效」可能已经是几小时前的
+        结论，提交前必须重新问一次网盘端，否则会把早被删掉的链接交出去。
+        """
         url = str(share_url or "").strip()
         if not url or not service:
             return None
         now = time.time()
         cached = self._share_checked.get(url)
-        if cached and now - cached[0] < _SHARE_CHECK_TTL:
+        if not force and cached and now - cached[0] < _SHARE_CHECK_TTL:
             return cached[1]
         try:
             status = service.check_share_status(url)
