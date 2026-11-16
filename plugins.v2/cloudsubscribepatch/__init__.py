@@ -14,6 +14,7 @@ PT 站的新片首发资源质量普遍一般（多为 1080P WEB-DL 甚至 HDTV�
 2. 等待窗口内定时搜索网盘渠道，按画质/来源/音轨等打分，记录最优候选；
    需积分解锁的资源（如 Dian115）也按标题/描述参与打分，
    但只有排到第一时才交给同步链去解锁，不会为了比价白花积分；
+   Dian115 上「免费但需要点一次领取」的资源同样进候选（见下文层级 1）；
 3. 窗口到期时：
    - 找到了合格网盘资源 → 交给「网盘订阅助手」提交转存；
    - 没找到 → 放行并重新触发该订阅的 PT 搜索；
@@ -24,7 +25,8 @@ PT 站的新片首发资源质量普遍一般（多为 1080P WEB-DL 甚至 HDTV�
 同一轮里按「无需解锁的网盘资源 > 需解锁的网盘资源 > PT 资源」三级排序：
 网盘候选先比这一层级，再比画质评分；只要窗口内有任何网盘候选，
 就不会放行 PT。层级只看「能不能直接拿到链接」：网盘分享直链＝0，
-需积分解锁＝1，磁力/ed2k 这类要下载器去拖的＝2。
+需积分解锁（need_unlock）或免费待领取（need_access）＝1，
+磁力/ed2k 这类要下载器去拖的＝2。
 评分仍按画质/来源/中字/音轨累积。
 
 只对「网盘订阅助手」纳管的订阅生效（沿用它的 include/exclude 名单），
@@ -138,7 +140,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -470,7 +472,8 @@ class CloudSubscribePatch(_PluginBase):
                                                 "不改动原插件任何文件。等待期间该订阅的 PT 下载会被取消，"
                                                 "订阅状态保持追更。\n"
                                                 "候选按「无需解锁网盘 > 需解锁网盘 > PT」排序，"
-                                                "需解锁资源先按标题/描述参与比价，排到第一才解锁。"
+                                                "需解锁资源先按标题/描述参与比价，排到第一才解锁；"
+                                                "Dian115 上免费待领取的资源也算中间层候选。"
                                             ),
                                         },
                                     }
@@ -834,9 +837,19 @@ class CloudSubscribePatch(_PluginBase):
                 continue
             if best.get("need_unlock"):
                 logger.info(
-                    f"【网盘订阅智能下载补丁】{name} 第一名需解锁"
+                    f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名需解锁"
                     f"（{best.get('unlock_points') or 0} 积分），开始解锁：{best.get('title')}"
                 )
+            elif best.get("need_access"):
+                logger.info(
+                    f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名免费待领取，"
+                    f"开始获取链接：{best.get('title')}"
+                )
+                # start_selected_resources 只认 need_unlock+resource_ref，
+                # 免费待领取的候选得先在这里领一次，把 url 补上再交出去
+                resource = self._claim_free_resource(cloud, best, name)
+                if not resource:
+                    continue
             try:
                 result = cloud.start_selected_resources(int(window.get("sid") or 0), [resource])
             except Exception as error:
@@ -866,6 +879,52 @@ class CloudSubscribePatch(_PluginBase):
                 )
             return True
         return False
+
+    def _claim_free_resource(
+            self, cloud: Any, best: Dict[str, Any], name: str
+    ) -> Optional[Dict[str, Any]]:
+        """免费待领取的网盘资源：先向渠道换一次真实链接，再交给同步链。
+
+        原插件的 `start_selected_resources` 只接受「有直链」或「need_unlock +
+        resource_ref」的候选，need_access 这类免费资源会被直接跳过，
+        所以这里先调渠道的解锁接口把 url 补上。
+        """
+        resource = dict(best.get("resource") or {})
+        source = str(resource.get("source") or best.get("source") or "").strip()
+        if not source or not resource:
+            return None
+        try:
+            search_handler = cloud._search_handler
+            if not search_handler.can_unlock(source):
+                logger.warning(
+                    f"【网盘订阅智能下载补丁】{name} 渠道 {source} 不支持领取，跳过"
+                )
+                return None
+            unlocked = search_handler.unlock_resource(
+                source, resource, search_label=f"智能下载补丁·{name}"
+            )
+        except Exception as error:
+            logger.error(
+                f"【网盘订阅智能下载补丁】{name} 领取免费资源失败：{error}"
+            )
+            return None
+        url = ""
+        if isinstance(unlocked, str):
+            url = unlocked.strip()
+        elif isinstance(unlocked, dict):
+            url = str(unlocked.get("url") or "").strip()
+        if not url:
+            logger.warning(
+                f"【网盘订阅智能下载补丁】{name} 领取未拿到链接：{best.get('title')}"
+            )
+            return None
+        resource["url"] = url
+        resource["need_access"] = False
+        resource["is_unlocked"] = True
+        logger.info(
+            f"【网盘订阅智能下载补丁】{name} 已领取免费链接：{best.get('title')}"
+        )
+        return resource
 
     def _trigger_pt_search(self, sid: int, name: str) -> None:
         if sid <= 0:
@@ -919,12 +978,27 @@ class CloudSubscribePatch(_PluginBase):
             apply_platform_rules=False,
         )
         scored: List[Dict[str, Any]] = []
+        stats: Dict[str, Any] = {}
         for source, items in (results or {}).items():
+            total = len(items or [])
+            kept = 0
             for item in items or []:
                 candidate = self._score_candidate(source, item)
                 if candidate:
+                    kept += 1
                     scored.append(candidate)
+            stats[source] = {"raw": total, "kept": kept}
         scored.sort(key=self._candidate_sort_key)
+        # 把每个渠道的原始/入选数量挂在窗口上，方便在 /status 里排查
+        window["source_stats"] = stats
+        if stats:
+            logger.info(
+                f"【网盘订阅智能下载补丁】{window.get('name')} 渠道统计："
+                + "，".join(
+                    f"{source} {value['raw']}→{value['kept']}"
+                    for source, value in stats.items()
+                )
+            )
         return scored
 
     @staticmethod
@@ -944,7 +1018,9 @@ class CloudSubscribePatch(_PluginBase):
             return 2
         if url:
             return 0
-        return 1 if item.get("need_unlock") else 2
+        # need_unlock=花积分解锁；need_access=免费但要点开页面领取，
+        # 两者都没有直链、都要先走一次解锁链，同属中间层
+        return 1 if (item.get("need_unlock") or item.get("need_access")) else 2
 
     def _candidate_sort_key(self, candidate: Dict[str, Any]) -> tuple:
         """先按层级、再按评分——层级压过分数，保证「无需解锁 > 需解锁 > PT」."""
@@ -961,11 +1037,14 @@ class CloudSubscribePatch(_PluginBase):
         if not isinstance(item, dict):
             return None
         url = str(item.get("url") or "").strip()
-        unlock = bool(item.get("need_unlock") and item.get("resource_ref"))
-        if not url and not unlock:
+        has_ref = bool(item.get("resource_ref"))
+        # need_unlock=花积分解锁；need_access=免费领取（也要点一次页面才拿到链接）
+        unlock = bool(item.get("need_unlock") and has_ref)
+        claim = bool(item.get("need_access") and has_ref)
+        if not url and not unlock and not claim:
             return None
         # 未解锁资源：只在允许解锁时才进候选，且不超过积分上限
-        if unlock:
+        if unlock or claim:
             if not self._allow_unlock:
                 return None
             points = self._as_int(item.get("unlock_points"), 0)
@@ -1017,15 +1096,20 @@ class CloudSubscribePatch(_PluginBase):
             score += min(5.0, size_bytes / (1024 ** 3) / 10.0)
 
         tier = self._candidate_tier({**item, "source": item.get("source") or source})
+        if tier == 1:
+            tier_text = "需解锁网盘" if unlock else "免费领取网盘"
+        else:
+            tier_text = {0: "网盘直链", 2: "PT / 其他"}.get(tier, "其他")
         return {
             "title": title,
             "source": str(item.get("source") or source or ""),
             "tier": tier,
-            "tier_text": {0: "网盘直链", 1: "需解锁网盘", 2: "PT / 其他"}.get(tier, "其他"),
+            "tier_text": tier_text,
             "score": round(score, 2),
             "tags": tags,
             "size_text": self._size_text(size_bytes),
             "need_unlock": unlock,
+            "need_access": claim,
             "unlock_points": int(item.get("unlock_points") or 0),
             "resource": dict(item),
             "found_at": time.time(),
