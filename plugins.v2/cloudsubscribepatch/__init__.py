@@ -12,10 +12,20 @@ PT 站的新片首发资源质量普遍一般（多为 1080P WEB-DL 甚至 HDTV�
 ----------------
 1. PT 资源即将下载时先拦下（不建种、不占下载器），并为该订阅开一个等待窗口；
 2. 等待窗口内定时搜索网盘渠道，按画质/来源/音轨等打分，记录最优候选；
+   需积分解锁的资源（如 Dian115）也按标题/描述参与打分，
+   但只有排到第一时才交给同步链去解锁，不会为了比价白花积分；
 3. 窗口到期时：
    - 找到了合格网盘资源 → 交给「网盘订阅助手」提交转存；
    - 没找到 → 放行并重新触发该订阅的 PT 搜索；
 4. 全程不修改原插件任何文件，只挂事件与独立定时服务。
+
+候选优先级
+----------
+同一轮里按「无需解锁的网盘资源 > 需解锁的网盘资源 > PT 资源」三级排序：
+网盘候选先比这一层级，再比画质评分；只要窗口内有任何网盘候选，
+就不会放行 PT。层级只看「能不能直接拿到链接」：网盘分享直链＝0，
+需积分解锁＝1，磁力/ed2k 这类要下载器去拖的＝2。
+评分仍按画质/来源/中字/音轨累积。
 
 只对「网盘订阅助手」纳管的订阅生效（沿用它的 include/exclude 名单），
 两个插件任一未启用时本插件自动放行，不做任何拦截。
@@ -128,7 +138,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -180,6 +190,10 @@ class CloudSubscribePatch(_PluginBase):
         self._min_resolution = str(config.get("min_resolution") or "any").strip()
         if self._min_resolution not in {"any", "1080P", "4K"}:
             self._min_resolution = "any"
+        self._allow_unlock = bool(config.get("allow_unlock", True))
+        self._max_unlock_points = max(
+            0, self._as_int(config.get("max_unlock_points"), 0)
+        )
         self._notify = bool(config.get("notify", True))
         self._dry_run = bool(config.get("dry_run"))
 
@@ -234,6 +248,13 @@ class CloudSubscribePatch(_PluginBase):
             {"title": "不限", "value": "any"},
             {"title": "至少 1080P", "value": "1080P"},
             {"title": "只要 4K", "value": "4K"},
+        ]
+        points_options = [
+            {"title": "不限", "value": 0},
+            {"title": "10 积分以内", "value": 10},
+            {"title": "30 积分以内", "value": 30},
+            {"title": "50 积分以内", "value": 50},
+            {"title": "100 积分以内", "value": 100},
         ]
         return [
             {
@@ -398,7 +419,38 @@ class CloudSubscribePatch(_PluginBase):
                                         },
                                     }
                                 ],
-                            }
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "allow_unlock",
+                                            "label": "允许花积分解锁候选",
+                                            "hint": "关闭后未解锁资源只参与比价、永远不会被选；开启则只有排到第一时才解锁",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "max_unlock_points",
+                                            "label": "单次解锁积分上限",
+                                            "items": points_options,
+                                            "hint": "超过这个积分数的需解锁资源直接跳过，避免为了一部片花太多积分",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -416,7 +468,9 @@ class CloudSubscribePatch(_PluginBase):
                                             "text": (
                                                 "本插件只对「网盘订阅助手」纳管的订阅生效，"
                                                 "不改动原插件任何文件。等待期间该订阅的 PT 下载会被取消，"
-                                                "订阅状态保持追更。"
+                                                "订阅状态保持追更。\n"
+                                                "候选按「无需解锁网盘 > 需解锁网盘 > PT」排序，"
+                                                "需解锁资源先按标题/描述参与比价，排到第一才解锁。"
                                             ),
                                         },
                                     }
@@ -437,6 +491,8 @@ class CloudSubscribePatch(_PluginBase):
             "exclude_dolby_vision": False,
             "require_mandarin": False,
             "min_resolution": "any",
+            "allow_unlock": True,
+            "max_unlock_points": 0,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -452,7 +508,8 @@ class CloudSubscribePatch(_PluginBase):
                     str(item.get("name") or item.get("sid"))
                     + f"：剩余 {remain / 3600:.1f} 小时，"
                     + (
-                        f"最优候选「{best.get('title')}」(评分 {best.get('score')})"
+                        f"最优候选「{best.get('title')}」"
+                        f"（{best.get('tier_text') or '网盘'}，评分 {best.get('score')}）"
                         if best
                         else "尚未找到网盘候选"
                     )
@@ -697,17 +754,24 @@ class CloudSubscribePatch(_PluginBase):
             return
 
         candidates = self._search_cloud(cloud, subscribe, window)
+        # 磁力/PT 类候选本来就能直接下，没必要等窗口、也不进备选
+        candidates = [
+            item for item in candidates
+            if int(item.get("tier") if item.get("tier") is not None else 2) < 2
+        ]
         if not candidates:
             logger.info(f"【网盘订阅智能下载补丁】{window.get('name')} 本次未搜到可用网盘资源")
             return
         best = candidates[0]
         old = window.get("best") or {}
-        improved = not old or float(best.get("score") or 0) > float(old.get("score") or 0)
+        improved = not old or self._candidate_sort_key(best) < self._candidate_sort_key(old)
         if improved:
             window["best"] = best
+            # 留一截备选：万一最优候选解锁失败，还能顺位往下试
+            window["ranked"] = candidates[:5]
             logger.info(
                 f"【网盘订阅智能下载补丁】{window.get('name')} 记录更优候选："
-                f"{best.get('title')}（评分 {best.get('score')}）"
+                f"{best.get('title')}（{best.get('tier_text')}，评分 {best.get('score')}）"
             )
         window["searches"] = int(window.get("searches") or 0) + 1
         with self._lock:
@@ -735,43 +799,73 @@ class CloudSubscribePatch(_PluginBase):
         self._trigger_pt_search(int(window.get("sid") or 0), str(name))
 
     def _submit_best(self, window: Dict[str, Any], cloud: Any) -> bool:
-        best = window.get("best") or {}
+        """提交最优候选；需解锁的资源只有排到这里才会真正花积分解锁。
+
+        解锁失败（积分不足/节点失效）时顺位尝试备选，避免整窗白等。
+        """
         name = window.get("name") or window.get("sid")
-        resource = best.get("resource") or {}
-        if not resource:
+        ranked = window.get("ranked") or []
+        if not ranked:
+            best = window.get("best") or {}
+            ranked = [best] if best else []
+        if not ranked:
             return False
         if self._dry_run:
+            best = ranked[0]
             logger.info(
-                f"【网盘订阅智能下载补丁】干跑：将提交 {name} → {best.get('title')}"
+                f"【网盘订阅智能下载补丁】干跑：将提交 {name} → "
+                f"{best.get('title')}（{best.get('tier_text')}）"
             )
             return False
-        try:
-            result = cloud.start_selected_resources(int(window.get("sid") or 0), [resource])
-        except Exception as error:
-            logger.error(f"【网盘订阅智能下载补丁】提交候选失败：{error}")
-            return False
-        if not (isinstance(result, dict) and result.get("success")):
-            logger.warning(
-                f"【网盘订阅智能下载补丁】提交候选未成功：{result}"
+
+        for index, best in enumerate(ranked):
+            resource = best.get("resource") or {}
+            if not resource:
+                continue
+            tier = best.get("tier")
+            if tier is None:
+                tier = self._candidate_tier(resource)
+            if int(tier) >= 2:
+                # 磁力/PT 类候选不交给网盘链：PT 本来就能直接下，没必要再经离线拖一遍
+                logger.info(
+                    f"【网盘订阅智能下载补丁】{name} 跳过第 {index + 1} 名"
+                    f"（{best.get('tier_text') or 'PT'}），保留 PT 直下更省事"
+                )
+                continue
+            if best.get("need_unlock"):
+                logger.info(
+                    f"【网盘订阅智能下载补丁】{name} 第一名需解锁"
+                    f"（{best.get('unlock_points') or 0} 积分），开始解锁：{best.get('title')}"
+                )
+            try:
+                result = cloud.start_selected_resources(int(window.get("sid") or 0), [resource])
+            except Exception as error:
+                logger.error(f"【网盘订阅智能下载补丁】提交候选失败：{error}")
+                continue
+            if not (isinstance(result, dict) and result.get("success")):
+                logger.warning(
+                    f"【网盘订阅智能下载补丁】候选 {index + 1} 提交未成功：{result}"
+                )
+                continue
+            logger.info(
+                f"【网盘订阅智能下载补丁】{name} 已提交网盘资源：{best.get('title')}"
             )
-            return False
-        logger.info(
-            f"【网盘订阅智能下载补丁】{name} 已提交网盘资源：{best.get('title')}"
-        )
-        self._close_window(str(window.get("sid")))
-        if self._notify:
-            self.post_message(
-                mtype="订阅",
-                title="【智能下载】已选用网盘资源",
-                text=(
-                    f"{name}\n"
-                    f"资源：{best.get('title')}\n"
-                    f"来源：{best.get('source') or '网盘'}\n"
-                    f"评分：{best.get('score')}\n"
-                    f"文件大小：{best.get('size_text') or '未知'}"
-                ),
-            )
-        return True
+            self._close_window(str(window.get("sid")))
+            if self._notify:
+                self.post_message(
+                    mtype="订阅",
+                    title="【智能下载】已选用网盘资源",
+                    text=(
+                        f"{name}\n"
+                        f"资源：{best.get('title')}\n"
+                        f"来源：{best.get('source') or '网盘'}"
+                        f"（{best.get('tier_text') or ''}）\n"
+                        f"评分：{best.get('score')}\n"
+                        f"文件大小：{best.get('size_text') or '未知'}"
+                    ),
+                )
+            return True
+        return False
 
     def _trigger_pt_search(self, sid: int, name: str) -> None:
         if sid <= 0:
@@ -820,6 +914,9 @@ class CloudSubscribePatch(_PluginBase):
             season=season if media_type == MediaType.TV else None,
             target_episodes=target_episodes,
             subscribe=subscribe,
+            # 列表模式：不做平台规则过滤、也不因「未解锁」被剔除，
+            # 让需积分解锁的资源也能按标题/描述参与比价
+            apply_platform_rules=False,
         )
         scored: List[Dict[str, Any]] = []
         for source, items in (results or {}).items():
@@ -827,8 +924,38 @@ class CloudSubscribePatch(_PluginBase):
                 candidate = self._score_candidate(source, item)
                 if candidate:
                     scored.append(candidate)
-        scored.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
+        scored.sort(key=self._candidate_sort_key)
         return scored
+
+    @staticmethod
+    def _candidate_tier(item: Any) -> int:
+        """候选层级：0=直接可用的网盘直链，1=需解锁网盘，2=磁力/PT 资源。
+
+        只看「能不能直接拿到链接」：磁力、ed2k 属于要下载器去拖的 PT 类资源，
+        网盘分享链接才是直链；没有直链但可花积分解锁的算中间层。
+        """
+        if not isinstance(item, dict):
+            return 2
+        resource_type = str(item.get("resource_type") or "").strip().lower()
+        if resource_type in {"magnet", "ed2k", "torrent"}:
+            return 2
+        url = str(item.get("url") or "").strip().lower()
+        if url.startswith("magnet:") or url.startswith("ed2k://"):
+            return 2
+        if url:
+            return 0
+        return 1 if item.get("need_unlock") else 2
+
+    def _candidate_sort_key(self, candidate: Dict[str, Any]) -> tuple:
+        """先按层级、再按评分——层级压过分数，保证「无需解锁 > 需解锁 > PT」."""
+        tier = candidate.get("tier")
+        if tier is None:
+            tier = 2
+        try:
+            tier = int(tier)
+        except (TypeError, ValueError):
+            tier = 2
+        return (tier, -float(candidate.get("score") or 0))
 
     def _score_candidate(self, source: str, item: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(item, dict):
@@ -837,8 +964,17 @@ class CloudSubscribePatch(_PluginBase):
         unlock = bool(item.get("need_unlock") and item.get("resource_ref"))
         if not url and not unlock:
             return None
+        # 未解锁资源：只在允许解锁时才进候选，且不超过积分上限
+        if unlock:
+            if not self._allow_unlock:
+                return None
+            points = self._as_int(item.get("unlock_points"), 0)
+            if self._max_unlock_points > 0 and points > self._max_unlock_points:
+                return None
         title = str(item.get("title") or "")
-        tags = _extract_tags(title)
+        description = str(item.get("description") or "")
+        # 未解锁资源只能靠标题+描述判断画质，描述里常带完整文件名
+        tags = _extract_tags(f"{title} {description}".strip())
         upper_tags = {str(t) for t in tags}
 
         # 排除规则
@@ -880,12 +1016,17 @@ class CloudSubscribePatch(_PluginBase):
             # 同档位下体积越大通常码率越高，最多再给 5 分
             score += min(5.0, size_bytes / (1024 ** 3) / 10.0)
 
+        tier = self._candidate_tier({**item, "source": item.get("source") or source})
         return {
             "title": title,
             "source": str(item.get("source") or source or ""),
+            "tier": tier,
+            "tier_text": {0: "网盘直链", 1: "需解锁网盘", 2: "PT / 其他"}.get(tier, "其他"),
             "score": round(score, 2),
             "tags": tags,
             "size_text": self._size_text(size_bytes),
+            "need_unlock": unlock,
+            "unlock_points": int(item.get("unlock_points") or 0),
             "resource": dict(item),
             "found_at": time.time(),
         }
