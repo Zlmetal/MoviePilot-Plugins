@@ -70,6 +70,13 @@ _CHAIN_PRIORITY = 1
 _SHARE_CHECK_TTL = 6 * 60 * 60   # 同一链接 6 小时内不重复校验
 _SHARE_CHECK_BUDGET = 5          # 单次巡检最多校验 5 个链接（115 有 QPS 限制）
 
+# 链接寿命：pansou 这类聚合源给的都是别人转发的第三方分享，24 小时内
+# 常被取消；dian115 解锁出来的链接、平台自有链接要持久得多。
+# 排序时把「短效直链」压到「需解锁网盘」后面——宁可花一次积分等个稳的，
+# 也别好不容等到期才发现链接早被人删了。
+_FRAGILE_SOURCES = frozenset({"pansou"})
+_FRAGILE_RANK = 1.9              # 落在「需解锁网盘(1)」与「PT(2)」之间的档位
+
 # 画质/来源排序权重（数值越大越好）
 _RESOLUTION_SCORE = {"4K": 40, "1080P": 25, "720P": 10}
 _SOURCE_SCORE = {
@@ -153,7 +160,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -176,6 +183,7 @@ class CloudSubscribePatch(_PluginBase):
     _min_resolution: str = "any"
     _notify: bool = True
     _dry_run: bool = False
+    _prefer_stable_links: bool = True
 
     def __init__(self):
         super().__init__()
@@ -212,6 +220,7 @@ class CloudSubscribePatch(_PluginBase):
         self._max_unlock_points = max(
             0, self._as_int(config.get("max_unlock_points"), 0)
         )
+        self._prefer_stable_links = bool(config.get("prefer_stable_links", True))
         self._notify = bool(config.get("notify", True))
         self._dry_run = bool(config.get("dry_run"))
 
@@ -479,6 +488,26 @@ class CloudSubscribePatch(_PluginBase):
                                 "props": {"cols": 12},
                                 "content": [
                                     {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "prefer_stable_links",
+                                            "label": "优先稳定链接（第三方短效分享排到需解锁网盘之后）",
+                                            "hint": "pansou 这类聚合源给的第三方分享常在等待期内被取消；开启后它们排在需解锁网盘之后，宁可花一次积分解锁个稳的",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
                                         "component": "VAlert",
                                         "props": {
                                             "type": "info",
@@ -487,7 +516,7 @@ class CloudSubscribePatch(_PluginBase):
                                                 "本插件只对「网盘订阅助手」纳管的订阅生效，"
                                                 "不改动原插件任何文件。等待期间该订阅的 PT 下载会被取消，"
                                                 "订阅状态保持追更。\n"
-                                                "候选按「无需解锁网盘 > 需解锁网盘 > PT」排序，"
+                                                "候选按「无需解锁网盘 > 需解锁网盘 > 短效第三方分享 > PT」排序，"
                                                 "需解锁资源先按标题/描述参与比价，排到第一才解锁；"
                                                 "Dian115 上免费待领取的资源也算中间层候选。"
                                             ),
@@ -512,6 +541,7 @@ class CloudSubscribePatch(_PluginBase):
             "min_resolution": "any",
             "allow_unlock": True,
             "max_unlock_points": 0,
+            "prefer_stable_links": True,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -576,6 +606,7 @@ class CloudSubscribePatch(_PluginBase):
                     "enabled": self._enabled,
                     "dry_run": self._dry_run,
                     "wait_hours": self._wait_hours,
+                    "prefer_stable_links": self._prefer_stable_links,
                     "windows": list(self._windows.values()),
                 },
             }
@@ -1062,8 +1093,20 @@ class CloudSubscribePatch(_PluginBase):
         # 两者都没有直链、都要先走一次解锁链，同属中间层
         return 1 if (item.get("need_unlock") or item.get("need_access")) else 2
 
-    def _candidate_sort_key(self, candidate: Dict[str, Any]) -> tuple:
-        """先按层级、再按评分——层级压过分数，保证「无需解锁 > 需解锁 > PT」."""
+    def _candidate_rank(self, candidate: Dict[str, Any]) -> float:
+        """候选的排序档位（浮点）：0=直链，1=需解锁，1.9=短效直链，2=PT.
+
+        短效直链（pansou 这类聚合源转发的第三方分享）虽然能直接拿到链接，
+        但常在等待期内被人取消；把它压在「需解锁网盘」之后——
+        宁可花一次积分换个稳的，也别等到期才发现链接早没了。
+        关掉「优先稳定链接」开关后，短效直链恢复成普通直链（0）。
+        """
+        rank = candidate.get("rank")
+        if rank is not None:
+            try:
+                return float(rank)
+            except (TypeError, ValueError):
+                pass
         tier = candidate.get("tier")
         if tier is None:
             tier = 2
@@ -1071,7 +1114,11 @@ class CloudSubscribePatch(_PluginBase):
             tier = int(tier)
         except (TypeError, ValueError):
             tier = 2
-        return (tier, -float(candidate.get("score") or 0))
+        return float(tier)
+
+    def _candidate_sort_key(self, candidate: Dict[str, Any]) -> tuple:
+        """先按档位、再按评分——档位压过分数，保证「无需解锁 > 需解锁 > PT」."""
+        return (self._candidate_rank(candidate), -float(candidate.get("score") or 0))
 
     # ------------------------------------------------------------------
     # 分享链接有效性
@@ -1222,15 +1269,27 @@ class CloudSubscribePatch(_PluginBase):
             # 同档位下体积越大通常码率越高，最多再给 5 分
             score += min(5.0, size_bytes / (1024 ** 3) / 10.0)
 
-        tier = self._candidate_tier({**item, "source": item.get("source") or source})
-        if tier == 1:
+        source_name = str(item.get("source") or source or "")
+        tier = self._candidate_tier({**item, "source": source_name})
+        # 短效直链：聚合源转发的第三方分享，能直接拿到链接但寿命短
+        fragile = bool(
+            self._prefer_stable_links
+            and tier == 0
+            and source_name.strip().lower() in _FRAGILE_SOURCES
+        )
+        rank = _FRAGILE_RANK if fragile else float(tier)
+        if fragile:
+            tier_text = "网盘直链（短效分享）"
+        elif tier == 1:
             tier_text = "需解锁网盘" if unlock else "免费领取网盘"
         else:
             tier_text = {0: "网盘直链", 2: "PT / 其他"}.get(tier, "其他")
         return {
             "title": title,
-            "source": str(item.get("source") or source or ""),
+            "source": source_name,
             "tier": tier,
+            "rank": round(rank, 2),
+            "fragile": fragile,
             "tier_text": tier_text,
             "score": round(score, 2),
             "tags": tags,
