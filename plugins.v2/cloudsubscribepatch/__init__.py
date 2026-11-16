@@ -29,6 +29,14 @@ PT 站的新片首发资源质量普遍一般（多为 1080P WEB-DL 甚至 HDTV�
 磁力/ed2k 这类要下载器去拖的＝2。
 评分仍按画质/来源/中字/音轨累积。
 
+分享链接有效性
+--------------
+pansou 这类聚合源给的都是别人的第三方分享，等待期内经常被取消或删除，
+等到窗口到期才提交，同步链只会记一句「分享链接无效」然后整批失败。
+所以巡检时会向网盘端查一次链接状态，失效的直接剔除、不再占 best/ranked
+名额；提交前还会再确认一遍，死链就顺位到下一个候选。
+同一链接 6 小时内只查一次，单轮最多查 5 个（115 有 QPS 限制）。
+
 只对「网盘订阅助手」纳管的订阅生效（沿用它的 include/exclude 名单），
 两个插件任一未启用时本插件自动放行，不做任何拦截。
 """
@@ -56,6 +64,11 @@ _DATA_KEY = "windows"
 
 # 拦 PT 用的事件优先级：必须小于「网盘订阅助手」的默认值 10，才能先跑
 _CHAIN_PRIORITY = 1
+
+# 分享链接有效性校验：pansou 这类聚合源上的第三方分享常在等待期内被取消，
+# 到期才提交会白发一次请求，所以巡检与提交前都要先问一次网盘端。
+_SHARE_CHECK_TTL = 6 * 60 * 60   # 同一链接 6 小时内不重复校验
+_SHARE_CHECK_BUDGET = 5          # 单次巡检最多校验 5 个链接（115 有 QPS 限制）
 
 # 画质/来源排序权重（数值越大越好）
 _RESOLUTION_SCORE = {"4K": 40, "1080P": 25, "720P": 10}
@@ -140,7 +153,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -168,6 +181,9 @@ class CloudSubscribePatch(_PluginBase):
         super().__init__()
         self._windows: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
+        # 分享链接校验缓存：url -> (校验时间, 是否有效)
+        self._share_checked: Dict[str, Tuple[float, bool]] = {}
+        self._share_budget = _SHARE_CHECK_BUDGET
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -765,16 +781,31 @@ class CloudSubscribePatch(_PluginBase):
         if not candidates:
             logger.info(f"【网盘订阅智能下载补丁】{window.get('name')} 本次未搜到可用网盘资源")
             return
-        best = candidates[0]
+        # 聚合源（pansou 等）里的第三方分享经常在等待期内被取消，
+        # 提前校验一遍，别让死链占住 best/ranked 的名额、白等到期
+        self._share_budget = _SHARE_CHECK_BUDGET
+        alive = self._verify_candidates(cloud, candidates)
+        if not alive:
+            logger.info(
+                f"【网盘订阅智能下载补丁】{window.get('name')} 候选分享链接均已失效，本次不更新候选"
+            )
+            return
+        best = alive[0]
         old = window.get("best") or {}
-        improved = not old or self._candidate_sort_key(best) < self._candidate_sort_key(old)
+        old_dead = self._is_best_dead(cloud, old)
+        improved = (
+            old_dead
+            or not old
+            or self._candidate_sort_key(best) < self._candidate_sort_key(old)
+        )
         if improved:
             window["best"] = best
             # 留一截备选：万一最优候选解锁失败，还能顺位往下试
-            window["ranked"] = candidates[:5]
+            window["ranked"] = alive[:5]
             logger.info(
                 f"【网盘订阅智能下载补丁】{window.get('name')} 记录更优候选："
                 f"{best.get('title')}（{best.get('tier_text')}，评分 {best.get('score')}）"
+                + ("（原候选链接已失效，已替换）" if old_dead else "")
             )
         window["searches"] = int(window.get("searches") or 0) + 1
         with self._lock:
@@ -821,10 +852,19 @@ class CloudSubscribePatch(_PluginBase):
             )
             return False
 
+        service = self._share_transfer_service(cloud)
         for index, best in enumerate(ranked):
             resource = best.get("resource") or {}
             if not resource:
                 continue
+            # 等待期内分享可能已被取消，提交前再确认一次，别把死链交给同步链
+            url = str(resource.get("url") or "").strip()
+            if url and service:
+                if self._check_share_alive(service, url, name) is False:
+                    logger.info(
+                        f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名链接已失效，顺位下一个"
+                    )
+                    continue
             tier = best.get("tier")
             if tier is None:
                 tier = self._candidate_tier(resource)
@@ -1032,6 +1072,93 @@ class CloudSubscribePatch(_PluginBase):
         except (TypeError, ValueError):
             tier = 2
         return (tier, -float(candidate.get("score") or 0))
+
+    # ------------------------------------------------------------------
+    # 分享链接有效性
+    # ------------------------------------------------------------------
+    def _share_transfer_service(self, cloud: Any) -> Optional[Any]:
+        """取网盘客户端的分享能力（能查链接状态的那一层）。"""
+        holders = [getattr(cloud, "_sync_handler", None), cloud]
+        for holder in holders:
+            if holder is None:
+                continue
+            service = getattr(holder, "_share_transfer", None)
+            if service is not None and hasattr(service, "check_share_status"):
+                return service
+        # 兜底：直接翻当前网盘提供方注册的能力表（不依赖枚举导入路径）
+        provider = getattr(cloud, "_cloud_drive", None)
+        services = getattr(provider, "services", None)
+        try:
+            for service in (services or {}).values():
+                if hasattr(service, "check_share_status"):
+                    return service
+        except Exception:
+            pass
+        return None
+
+    def _check_share_alive(
+            self, service: Any, share_url: str, name: str = ""
+    ) -> Optional[bool]:
+        """查一个分享链接还在不在：True 有效 / False 失效 / None 查不了。"""
+        url = str(share_url or "").strip()
+        if not url or not service:
+            return None
+        now = time.time()
+        cached = self._share_checked.get(url)
+        if cached and now - cached[0] < _SHARE_CHECK_TTL:
+            return cached[1]
+        try:
+            status = service.check_share_status(url)
+        except Exception as error:
+            logger.debug(f"【网盘订阅智能下载补丁】校验分享失败 {url}：{error}")
+            return None
+        is_valid = bool(getattr(status, "is_valid", False))
+        reason = str(getattr(status, "status_text", "") or "")
+        if not is_valid:
+            logger.info(
+                f"【网盘订阅智能下载补丁】{name or ''} 候选链接已失效"
+                f"（{reason}）：{url.split('?')[0]}"
+            )
+        self._share_checked[url] = (now, is_valid)
+        return is_valid
+
+    def _verify_candidates(
+            self, cloud: Any, candidates: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """剔掉分享链接已失效的候选；需解锁/需领取的没有直链，跳过校验。
+
+        只为带 url 的候选查一次，且单轮有次数上限（115 有 QPS 限制）。
+        """
+        service = self._share_transfer_service(cloud)
+        if not service:
+            return candidates
+        alive: List[Dict[str, Any]] = []
+        for item in candidates:
+            resource = item.get("resource") or {}
+            url = str(resource.get("url") or "").strip()
+            if not url:
+                alive.append(item)
+                continue
+            budget = getattr(self, "_share_budget", _SHARE_CHECK_BUDGET)
+            if budget <= 0:
+                alive.append(item)
+                continue
+            self._share_budget = budget - 1
+            state = self._check_share_alive(service, url, str(item.get("title") or ""))
+            if state is False:
+                continue
+            alive.append(item)
+        return alive
+
+    def _is_best_dead(self, cloud: Any, best: Dict[str, Any]) -> bool:
+        """当前记录的最优候选链接是否已经失效。"""
+        if not best:
+            return False
+        service = self._share_transfer_service(cloud)
+        url = str((best.get("resource") or {}).get("url") or "").strip()
+        if not service or not url:
+            return False
+        return self._check_share_alive(service, url, str(best.get("title") or "")) is False
 
     def _score_candidate(self, source: str, item: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(item, dict):
