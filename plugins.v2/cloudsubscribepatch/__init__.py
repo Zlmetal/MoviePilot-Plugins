@@ -61,6 +61,9 @@ from app.schemas.types import ChainEventType, MediaType
 
 # 本插件等待窗口的持久化 key
 _DATA_KEY = "windows"
+# 「已经放弃网盘、交回 PT」的订阅：持久化 key 与放行时长
+_RELEASED_KEY = "pt_released"
+_PT_RELEASE_HOLD = 6 * 60 * 60   # 交回 PT 后 6 小时内不再重开窗口拦它
 
 # 拦 PT 用的事件优先级：必须小于「网盘订阅助手」的默认值 10，才能先跑
 _CHAIN_PRIORITY = 1
@@ -84,9 +87,8 @@ _FRAGILE_RANK = 1.9              # 落在「需解锁网盘(1)」与「PT(2)」�
 # 提交后确认：网盘订阅助手的 start_selected_resources 只是把候选塞进队列就
 # 返回 success，真正的转存失败（分享在提交瞬间被人取消）发生在几十秒之后。
 # 所以提交改走 sync_subscribes 同步跑完，用真实转存数判断成败；
-# 全失败时隔一会儿再来一轮，别把窗口一关了事。
-_SUBMIT_MAX_ATTEMPTS = 3         # 同一窗口最多连续尝试几轮
-_SUBMIT_RETRY_DELAY = 30 * 60    # 一轮候选全失败后隔多久再试
+# 全失败时窗口还有时间就留着等下一轮，没时间就真把订阅交回 PT。
+# 注意：交回 PT 之后必须留一段「放行期」，否则 PT 刚下就被自己重新开窗拦回去。
 
 # 画质/来源排序权重（数值越大越好）
 _RESOLUTION_SCORE = {"4K": 40, "1080P": 25, "720P": 10}
@@ -171,7 +173,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.5"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -203,6 +205,8 @@ class CloudSubscribePatch(_PluginBase):
         # 分享链接校验缓存：url -> (校验时间, 是否有效)
         self._share_checked: Dict[str, Tuple[float, bool]] = {}
         self._share_budget = _SHARE_CHECK_BUDGET
+        # 已交回 PT 的订阅：sid -> 放行截止时间戳
+        self._released: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -237,8 +241,18 @@ class CloudSubscribePatch(_PluginBase):
 
         # 载入持久化的等待窗口
         saved = self.get_data(_DATA_KEY)
+        released = self.get_data(_RELEASED_KEY)
         with self._lock:
             self._windows = dict(saved) if isinstance(saved, dict) else {}
+            self._released = (
+                {str(k): float(v) for k, v in released.items() if v}
+                if isinstance(released, dict) else {}
+            )
+            # 放行期早过了的就没必要再记着
+            now = time.time()
+            self._released = {
+                key: until for key, until in self._released.items() if until > now
+            }
 
         if self._enabled:
             logger.info(
@@ -684,6 +698,13 @@ class CloudSubscribePatch(_PluginBase):
 
         key = str(sid)
         now = time.time()
+        # 已经交回 PT 的订阅：放行期内一律不拦、不再开新窗口
+        if self._is_released(key):
+            logger.debug(
+                f"【网盘订阅智能下载补丁】{subscribe_info.get('name') or key} "
+                f"已交回 PT，放行期内不再拦截：{title}"
+            )
+            return
         with self._lock:
             window = self._windows.get(key)
             if window:
@@ -860,7 +881,8 @@ class CloudSubscribePatch(_PluginBase):
             if submitted:
                 return
         # 没有网盘资源（或提交失败）→ 收尾并重新触发 PT 搜索
-        self._close_window(str(window.get("sid")))
+        # 必须先记放行期，否则 PT 一搜到就被本插件重新开窗拦回去
+        self._mark_released(str(window.get("sid")))
         if self._notify:
             self.post_message(
                 mtype="订阅",
@@ -920,6 +942,8 @@ class CloudSubscribePatch(_PluginBase):
         """按名次依次提交，直到同步链确认真的转存成功；全失败再决定要不要回归 PT。"""
         key = str(sid)
         service = self._share_transfer_service(cloud)
+        # 每条候选到底为什么没成，最后要原样告诉用户，别只剩「转存 0 个文件」
+        failures: List[str] = []
         try:
             for index, best in enumerate(ranked):
                 resource = dict(best.get("resource") or {})
@@ -932,6 +956,7 @@ class CloudSubscribePatch(_PluginBase):
                         logger.info(
                             f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名链接已失效，顺位下一个"
                         )
+                        failures.append(f"{best.get('title')}：分享链接已失效")
                         continue
                 tier = best.get("tier")
                 if tier is None:
@@ -943,11 +968,19 @@ class CloudSubscribePatch(_PluginBase):
                         f"（{best.get('tier_text') or 'PT'}），保留 PT 直下更省事"
                     )
                     continue
+                # 只有当它真排到前面、马上要提交了，才花积分/领链接；
+                # 搜索与比价阶段全程不解锁。
                 if best.get("need_unlock"):
                     logger.info(
                         f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名需解锁"
-                        f"（{best.get('unlock_points') or 0} 积分），开始解锁：{best.get('title')}"
+                        f"（{best.get('unlock_points') or 0} 积分），确认采用后才解锁："
+                        f"{best.get('title')}"
                     )
+                    unlocked = self._unlock_resource(cloud, best, name, free=False)
+                    if not unlocked:
+                        failures.append(f"{best.get('title')}：解锁未拿到链接")
+                        continue
+                    resource = unlocked
                 elif best.get("need_access"):
                     logger.info(
                         f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名免费待领取，"
@@ -956,6 +989,7 @@ class CloudSubscribePatch(_PluginBase):
                     # 免费待领取的候选得先在这里领一次，把 url 补上再交出去
                     claimed = self._claim_free_resource(cloud, best, name)
                     if not claimed:
+                        failures.append(f"{best.get('title')}：领取未拿到链接")
                         continue
                     resource = claimed
                 success, detail = self._transfer_and_confirm(cloud, sid, resource, name)
@@ -964,6 +998,7 @@ class CloudSubscribePatch(_PluginBase):
                         f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名转存未成功"
                         f"（{detail}），顺位下一个：{best.get('title')}"
                     )
+                    failures.append(f"{best.get('title')}：{detail}")
                     continue
                 logger.info(
                     f"【网盘订阅智能下载补丁】{name} 已确认转存：{best.get('title')}"
@@ -984,11 +1019,12 @@ class CloudSubscribePatch(_PluginBase):
                         ),
                     )
                 return
-            self._all_candidates_failed(key, name, sid)
+            self._all_candidates_failed(key, name, sid, failures)
         except Exception as error:
             logger.error(f"【网盘订阅智能下载补丁】{name} 提交线程异常：{error}")
             # 异常也要收尾，否则窗口每轮巡检都会重试同一个坏候选
-            self._all_candidates_failed(key, name, sid)
+            failures.append(f"提交线程异常：{error}")
+            self._all_candidates_failed(key, name, sid, failures)
         finally:
             with self._lock:
                 current = self._windows.get(key)
@@ -1013,11 +1049,16 @@ class CloudSubscribePatch(_PluginBase):
             return False, "网盘订阅助手版本不支持同步执行，无法确认结果"
         snapshot: Dict[str, Any] = {}
         try:
+            # manual_upgrade=False 必须显式传：带订阅 ID 的手动提交在
+            # `_do_api_vue_start_manual_sync` 里会被默认注入 manual_upgrade=True，
+            # 走进洗版分支——网盘里找不到旧文件时直接 return 0，
+            # 既不转存也不报错，正是「转存 0 个文件」的元凶之一。
             sync(
                 subscribe_id=sid,
                 manual_resources=[resource],
                 result=snapshot,
                 wait_for_slot=True,
+                manual_upgrade=False,
             )
         except Exception as error:
             return False, f"调用同步链异常：{error}"
@@ -1040,7 +1081,10 @@ class CloudSubscribePatch(_PluginBase):
             return True, message
         return False, message or "未转存任何文件"
 
-    def _all_candidates_failed(self, key: str, name: str, sid: int) -> None:
+    def _all_candidates_failed(
+            self, key: str, name: str, sid: int,
+            failures: Optional[List[str]] = None
+    ) -> None:
         """候选全部转存失败：窗口还有时间就清空候选等下一轮，没时间就回归 PT。"""
         now = time.time()
         with self._lock:
@@ -1059,15 +1103,16 @@ class CloudSubscribePatch(_PluginBase):
                 f"窗口内继续等待新的网盘资源"
             )
             return
-        self._close_window(key)
+        self._mark_released(key)
+        detail_lines = "\n".join(f"· {item}" for item in (failures or [])[:5])
         if self._notify:
             self.post_message(
                 mtype="订阅",
                 title="【智能下载】网盘候选转存失败，回归 PT",
                 text=(
                     f"{name}\n"
-                    f"窗口内找到的网盘候选要么链接失效、要么转存 0 个文件，"
-                    f"已放弃网盘渠道并重新触发 PT 搜索下载。"
+                    f"已放弃网盘渠道并重新触发 PT 搜索下载。\n"
+                    + (f"各候选失败原因：\n{detail_lines}" if detail_lines else "窗口内没有可用候选。")
                 ),
             )
         self._trigger_pt_search(sid, name)
@@ -1075,21 +1120,36 @@ class CloudSubscribePatch(_PluginBase):
     def _claim_free_resource(
             self, cloud: Any, best: Dict[str, Any], name: str
     ) -> Optional[Dict[str, Any]]:
-        """免费待领取的网盘资源：先向渠道换一次真实链接，再交给同步链。
+        """兼容旧名：免费待领取与需积分解锁都走同一套换链接流程。"""
+        return self._unlock_resource(cloud, best, name, free=True)
 
-        原插件的 `start_selected_resources` 只接受「有直链」或「need_unlock +
-        resource_ref」的候选，need_access 这类免费资源会被直接跳过，
-        所以这里先调渠道的解锁接口把 url 补上。
+    def _unlock_resource(
+            self, cloud: Any, best: Dict[str, Any], name: str,
+            free: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """把「还没有真实链接」的网盘候选换成可转存的直链。
+
+        两种候选都会走到这里：
+          * need_access   —— 免费待领取，unlock_points <= 0
+          * need_unlock   —— 需要积分解锁，unlock_points > 0
+        只有排到第一名、真要提交了才调它，搜索/比价阶段全程不解锁
+        （所以每次等待窗口只会消耗第一名的积分，不会为陪跑的候选白花钱）。
+
+        原插件 1.1.4 在这里只对 need_access 调渠道接口，need_unlock 只打一行
+        「开始解锁」的日志就往下走，候选带着空 url 进同步链，在
+        `_resolve_candidate_resource_url` 里被 `can_unlock` / 预算检查挡掉，
+        最终表现为「转存 0 个文件」——这就是 1.1.5 要修的第二个坑。
         """
         resource = dict(best.get("resource") or {})
         source = str(resource.get("source") or best.get("source") or "").strip()
         if not source or not resource:
             return None
+        label = "领取" if free else "解锁"
         try:
             search_handler = cloud._search_handler
             if not search_handler.can_unlock(source):
                 logger.warning(
-                    f"【网盘订阅智能下载补丁】{name} 渠道 {source} 不支持领取，跳过"
+                    f"【网盘订阅智能下载补丁】{name} 渠道 {source} 不支持{label}，跳过"
                 )
                 return None
             unlocked = search_handler.unlock_resource(
@@ -1097,7 +1157,7 @@ class CloudSubscribePatch(_PluginBase):
             )
         except Exception as error:
             logger.error(
-                f"【网盘订阅智能下载补丁】{name} 领取免费资源失败：{error}"
+                f"【网盘订阅智能下载补丁】{name} {label}资源失败：{error}"
             )
             return None
         url = ""
@@ -1107,14 +1167,15 @@ class CloudSubscribePatch(_PluginBase):
             url = str(unlocked.get("url") or "").strip()
         if not url:
             logger.warning(
-                f"【网盘订阅智能下载补丁】{name} 领取未拿到链接：{best.get('title')}"
+                f"【网盘订阅智能下载补丁】{name} {label}未拿到链接：{best.get('title')}"
             )
             return None
         resource["url"] = url
         resource["need_access"] = False
+        resource["need_unlock"] = False
         resource["is_unlocked"] = True
         logger.info(
-            f"【网盘订阅智能下载补丁】{name} 已领取免费链接：{best.get('title')}"
+            f"【网盘订阅智能下载补丁】{name} 已{label}拿到链接：{best.get('title')}"
         )
         return resource
 
@@ -1484,10 +1545,34 @@ class CloudSubscribePatch(_PluginBase):
         for key, item in self._windows.items():
             value = dict(item)
             snapshot[key] = value
+        released = {key: float(until) for key, until in self._released.items()}
         try:
             self.save_data(_DATA_KEY, snapshot)
+            self.save_data(_RELEASED_KEY, released)
         except Exception as error:
             logger.debug(f"【网盘订阅智能下载补丁】持久化等待窗口失败：{error}")
+
+    def _mark_released(self, key: str) -> None:
+        """关窗并记下「这个订阅已经交回 PT」，放行期内不再重开等待窗口。
+
+        没有这段放行期的话，交回 PT 后重新触发的搜索会在几秒内再次触发
+        ResourceDownload 事件，本插件看窗口已关就立刻又开一个新窗口把它拦回去，
+        结果就是「通知说回归 PT，实际永远下不成」。
+        """
+        with self._lock:
+            self._windows.pop(key, None)
+            self._released[key] = time.time() + _PT_RELEASE_HOLD
+            self._persist()
+
+    def _is_released(self, key: str) -> bool:
+        with self._lock:
+            until = float(self._released.get(key) or 0)
+            if until <= 0:
+                return False
+            if time.time() >= until:
+                self._released.pop(key, None)
+                return False
+            return True
 
     @staticmethod
     def _size_text(size_bytes: int) -> str:
