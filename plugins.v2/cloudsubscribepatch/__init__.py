@@ -177,7 +177,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.8"
+    plugin_version = "1.1.9"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -699,7 +699,6 @@ class CloudSubscribePatch(_PluginBase):
             item
             for item in items
             if item.get("event_type") in wanted
-            and "cloudsubscribepatch" in str(item.get("handler_identifier", "")).lower()
         ]
         return {
             "success": True,
