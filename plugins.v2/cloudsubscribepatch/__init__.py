@@ -177,7 +177,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.6"
+    plugin_version = "1.1.7"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -717,6 +717,10 @@ class CloudSubscribePatch(_PluginBase):
         等待窗口；而真正还没资源的，这里搜不到就什么都不做，等 PT 首次命中时
         照旧开等待窗口比对。
         """
+        logger.info(
+            f"【网盘订阅智能下载补丁】收到订阅新增事件：enabled={self._enabled} "
+            f"dry_run={self._dry_run} instant={self._instant_search}"
+        )
         if not self._enabled or self._dry_run or not self._instant_search:
             return
         event_data = getattr(event, "event_data", None) or {}
@@ -738,8 +742,12 @@ class CloudSubscribePatch(_PluginBase):
     def _handle_subscribe_added(self, sid: int) -> None:
         cloud = self._cloud_plugin()
         if not cloud:
+            logger.info("【网盘订阅智能下载补丁】网盘订阅助手未运行，跳过即时检索")
             return
         if not self._is_managed(cloud, sid):
+            logger.info(
+                f"【网盘订阅智能下载补丁】订阅 {sid} 不在助手纳管范围，跳过即时检索"
+            )
             return
         key = str(sid)
         # 已经交回 PT 的订阅，放行期内不抢先；让它按 PT 流程走
