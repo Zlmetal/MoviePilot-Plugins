@@ -57,7 +57,7 @@ from app.core.plugin import PluginManager
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas.types import ChainEventType, MediaType
+from app.schemas.types import ChainEventType, EventType, MediaType
 
 # 本插件等待窗口的持久化 key
 _DATA_KEY = "windows"
@@ -76,6 +76,10 @@ _SHARE_CHECK_BUDGET = 5          # 单次巡检最多校验 5 个链接（115 �
 # 提交 + 等同步链回结果可能要几十秒到几分钟；这段时间用 submitting_at
 # 压住重复提交，超时视为线程已死，允许重来。
 _SUBMIT_STALE_SECONDS = 2 * 60 * 60
+
+# 订阅刚添加时的一次性即时检索（不等 PT 首发、也不占等待窗口）。
+# 事件里可能同时收到同步与异步两次广播，用这个窗口做幂等。
+_INSTANT_DEDUP_SECONDS = 10 * 60
 
 # 链接寿命：pansou 这类聚合源给的都是别人转发的第三方分享，24 小时内
 # 常被取消；dian115 解锁出来的链接、平台自有链接要持久得多。
@@ -173,7 +177,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.5"
+    plugin_version = "1.1.6"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -197,6 +201,7 @@ class CloudSubscribePatch(_PluginBase):
     _notify: bool = True
     _dry_run: bool = False
     _prefer_stable_links: bool = True
+    _instant_search: bool = True
 
     def __init__(self):
         super().__init__()
@@ -207,6 +212,9 @@ class CloudSubscribePatch(_PluginBase):
         self._share_budget = _SHARE_CHECK_BUDGET
         # 已交回 PT 的订阅：sid -> 放行截止时间戳
         self._released: Dict[str, float] = {}
+        # 刚添加订阅的即时检索任务：sid -> {sid, started_at, finished_at}
+        # 只存内存，重启丢失无妨（重启后 MP 的自动搜索会走常规等待流程）
+        self._instant_tasks: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -236,6 +244,7 @@ class CloudSubscribePatch(_PluginBase):
             0, self._as_int(config.get("max_unlock_points"), 0)
         )
         self._prefer_stable_links = bool(config.get("prefer_stable_links", True))
+        self._instant_search = bool(config.get("instant_search", True))
         self._notify = bool(config.get("notify", True))
         self._dry_run = bool(config.get("dry_run"))
 
@@ -533,6 +542,27 @@ class CloudSubscribePatch(_PluginBase):
                                 "props": {"cols": 12},
                                 "content": [
                                     {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "instant_search",
+                                            "label": "订阅新增时立即检索网盘",
+                                            "hint": "添加订阅后马上搜一次网盘：已有资源就按评分直接转存最优候选、不再等 PT 首发也不用等满等待窗口；"
+                                                    "没搜到才回到上面的等待对比流程。剧集按集处理，已入库的集不重复追",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
                                         "component": "VAlert",
                                         "props": {
                                             "type": "info",
@@ -543,7 +573,11 @@ class CloudSubscribePatch(_PluginBase):
                                                 "订阅状态保持追更。\n"
                                                 "候选按「无需解锁网盘 > 需解锁网盘 > 短效第三方分享 > PT」排序，"
                                                 "需解锁资源先按标题/描述参与比价，排到第一才解锁；"
-                                                "Dian115 上免费待领取的资源也算中间层候选。"
+                                                "Dian115 上免费待领取的资源也算中间层候选。\n"
+                                                "开启「订阅新增时立即检索网盘」后，新加的订阅会先即时搜一次："
+                                                "已有网盘资源就按评分直接转存最优候选，不必等 PT 首发；"
+                                                "没搜到才进入上面的等待对比流程。剧集按集粒度处理，"
+                                                "已入库的集不重复追，后续新集仍走等待对比。"
                                             ),
                                         },
                                     }
@@ -567,6 +601,7 @@ class CloudSubscribePatch(_PluginBase):
             "allow_unlock": True,
             "max_unlock_points": 0,
             "prefer_stable_links": True,
+            "instant_search": True,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -670,6 +705,217 @@ class CloudSubscribePatch(_PluginBase):
             self._handle_resource_download(event_data)
         except Exception as error:
             logger.error(f"【网盘订阅智能下载补丁】处理下载事件异常：{error}")
+
+    # ------------------------------------------------------------------
+    # 事件：新订阅一加进来就先搜一次网盘
+    # ------------------------------------------------------------------
+    @eventmanager.register(EventType.SubscribeAdded)
+    def on_subscribe_added(self, event: Event):
+        """订阅新增即刻检索：有货就直接转存，没货才等 PT 首发走等待对比。
+
+        老片/补片这类订阅往往一加就命中网盘，没必要先等 PT 首发再等满整个
+        等待窗口；而真正还没资源的，这里搜不到就什么都不做，等 PT 首次命中时
+        照旧开等待窗口比对。
+        """
+        if not self._enabled or self._dry_run or not self._instant_search:
+            return
+        event_data = getattr(event, "event_data", None) or {}
+        sid = 0
+        try:
+            raw = event_data.get("subscribe_id") or event_data.get("id")
+            if not raw and isinstance(event_data.get("subscribe"), dict):
+                raw = event_data["subscribe"].get("id")
+            sid = int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            sid = 0
+        if sid <= 0:
+            return
+        try:
+            self._handle_subscribe_added(sid)
+        except Exception as error:
+            logger.error(f"【网盘订阅智能下载补丁】处理新增订阅事件异常：{error}")
+
+    def _handle_subscribe_added(self, sid: int) -> None:
+        cloud = self._cloud_plugin()
+        if not cloud:
+            return
+        if not self._is_managed(cloud, sid):
+            return
+        key = str(sid)
+        # 已经交回 PT 的订阅，放行期内不抢先；让它按 PT 流程走
+        if self._is_released(key):
+            return
+        now = time.time()
+        with self._lock:
+            task = self._instant_tasks.get(key) or {}
+            started = float(task.get("started_at") or 0)
+            if started and now - started < _INSTANT_DEDUP_SECONDS:
+                logger.debug(
+                    f"【网盘订阅智能下载补丁】订阅 {sid} 刚做过即时检索，跳过重复广播"
+                )
+                return
+            self._instant_tasks[key] = {"sid": sid, "started_at": now}
+        threading.Thread(
+            target=self._instant_worker,
+            args=(sid,),
+            daemon=True,
+            name=f"cloudsubscribe-patch-instant-{sid}",
+        ).start()
+
+    def _instant_worker(self, sid: int) -> None:
+        """新增订阅的即时检索线程：搜网盘 → 按评分+缺集覆盖排序 → 直接提交。"""
+        key = str(sid)
+        name = key
+        try:
+            cloud = self._cloud_plugin()
+            if not cloud:
+                return
+            subscribe = self._get_subscribe(sid)
+            if not subscribe:
+                logger.info(
+                    f"【网盘订阅智能下载补丁】订阅 {sid} 已不存在，跳过即时检索"
+                )
+                return
+            name = str(getattr(subscribe, "name", "") or key)
+            media_type = self._media_type(getattr(subscribe, "type", None))
+            if media_type is None:
+                return
+            season = int(getattr(subscribe, "season", 1) or 1)
+            # 剧集只追还没入库的集：已入库的集不再重复请求网盘
+            # None = 缺集算不出来（没有媒体库也没有订阅记录），按全集检索兜底
+            missing: Optional[List[int]] = None
+            if media_type == MediaType.TV:
+                missing = self._instant_missing_episodes(cloud, subscribe)
+                if missing is not None and not missing:
+                    logger.info(
+                        f"【网盘订阅智能下载补丁】{name} 当前没有缺集，跳过即时检索"
+                    )
+                    return
+            window = {
+                "sid": sid,
+                "name": name,
+                "type": media_type.value,
+                "season": season,
+                "episodes": missing or None,
+                "instant": True,
+                "opened_by": "订阅新增即时检索",
+            }
+            candidates = self._search_cloud(cloud, subscribe, window)
+            # 磁力/PT 类候选本来就能直接下，即时检索只处理网盘
+            candidates = [
+                item for item in candidates
+                if int(item.get("tier") if item.get("tier") is not None else 2) < 2
+            ]
+            if not candidates:
+                logger.info(
+                    f"【网盘订阅智能下载补丁】{name} 即时检索未搜到网盘资源，"
+                    f"等 PT 首发后走等待对比"
+                )
+                return
+            self._share_budget = _SHARE_CHECK_BUDGET
+            alive = self._verify_candidates(cloud, candidates)
+            if not alive:
+                logger.info(
+                    f"【网盘订阅智能下载补丁】{name} 即时检索到的分享均已失效，"
+                    f"等 PT 首发后走等待对比"
+                )
+                return
+            if media_type == MediaType.TV and missing:
+                alive = self._order_by_episode_coverage(alive, season, missing)
+                if not alive:
+                    logger.info(
+                        f"【网盘订阅智能下载补丁】{name} 搜到的资源都不覆盖当前缺集，"
+                        f"等 PT 首发后走等待对比"
+                    )
+                    return
+            ranked = alive[:5]
+            best = ranked[0]
+            logger.info(
+                f"【网盘订阅智能下载补丁】{name} 订阅新增即时检索命中："
+                f"{best.get('title')}（{best.get('tier_text')}，评分 {best.get('score')}），直接提交"
+            )
+            self._submit_worker(window, cloud, list(ranked), name, sid)
+        except Exception as error:
+            logger.error(f"【网盘订阅智能下载补丁】{name} 即时检索异常：{error}")
+        finally:
+            with self._lock:
+                task = self._instant_tasks.get(key)
+                if task is not None:
+                    # 留着 started_at 做 10 分钟幂等，别让同步/异步双播重复搜一次
+                    task["finished_at"] = time.time()
+                    self._instant_tasks[key] = task
+
+    def _instant_missing_episodes(
+            self, cloud: Any, subscribe: Any
+    ) -> Optional[List[int]]:
+        """取订阅当前还没入库的集号。
+
+        助手的 `_subscribe_missing_episodes` 在「算不出总集」和「一集不缺」时
+        都返回空列表，两者分不开——照它返回空当「不用搜了」，遇到没有媒体库
+        记录的新订阅就会把即时检索整个跳掉。这里自己算，只用两个明确信号：
+        总集数取自订阅记录，已入库集优先读媒体库、没有媒体库记录时退回订阅
+        自身的集数备注。返回 ``None`` 表示连总集都不知道，按全集检索。
+        """
+        try:
+            season = int(getattr(subscribe, "season", 0) or 1)
+            total = int(getattr(subscribe, "total_episode", 0) or 0)
+            if total <= 0:
+                return None
+            start = max(1, int(getattr(subscribe, "start_episode", 1) or 1))
+            expected = set(range(start, total + 1))
+            mediainfo = cloud._sync_handler._subscribe_mediainfo(
+                subscribe, MediaType.TV
+            )
+            existing: set = set()
+            try:
+                library = cloud._library_episodes(mediainfo, season)
+            except Exception:
+                library = None
+            if library:
+                existing = {int(e) for e in library if int(e) > 0}
+            else:
+                raw_note = getattr(subscribe, "note", None) or []
+                if isinstance(raw_note, str):
+                    raw_note = re.findall(r"\d+", raw_note)
+                existing = {
+                    int(value) for value in raw_note if str(value).isdigit()
+                }
+            return sorted(expected - existing)
+        except Exception as error:
+            logger.debug(
+                f"【网盘订阅智能下载补丁】缺集计算失败，按全集检索：{error}"
+            )
+            return None
+
+    def _order_by_episode_coverage(
+            self, candidates: List[Dict[str, Any]], season: int, missing: List[int]
+    ) -> List[Dict[str, Any]]:
+        """剧集专用排序：先按缺集覆盖，再按原有评分/档位，且剔掉完全不覆盖的。"""
+        targets = {int(e) for e in (missing or []) if int(e) > 0}
+        if not targets:
+            return candidates
+        try:
+            from app.plugins.cloudsubscribe.search.matching import (
+                missing_episode_coverage,
+            )
+        except Exception:
+            # 拿不到覆盖计算就按原顺序走，别把能转的资源挡掉
+            return candidates
+        scored: List[Tuple[int, int, Tuple, Dict[str, Any]]] = []
+        for item in candidates:
+            rank, covered = 1, set()
+            try:
+                rank, covered = missing_episode_coverage(
+                    item.get("resource") or {}, season, targets
+                )
+            except Exception:
+                rank, covered = 1, set()
+            # 2 = 明确不覆盖任何缺集，转存纯属白跑
+            if rank >= 2:
+                continue
+            scored.append((rank, -len(covered), self._candidate_sort_key(item), item))
+        scored.sort(key=lambda entry: entry[:3])
+        return [entry[3] for entry in scored]
 
     def _handle_resource_download(self, event_data: Any) -> None:
         cloud = self._cloud_plugin()
@@ -941,6 +1187,7 @@ class CloudSubscribePatch(_PluginBase):
     ) -> None:
         """按名次依次提交，直到同步链确认真的转存成功；全失败再决定要不要回归 PT。"""
         key = str(sid)
+        instant = bool(window.get("instant"))
         service = self._share_transfer_service(cloud)
         # 每条候选到底为什么没成，最后要原样告诉用户，别只剩「转存 0 个文件」
         failures: List[str] = []
@@ -1007,7 +1254,8 @@ class CloudSubscribePatch(_PluginBase):
                 if self._notify:
                     self.post_message(
                         mtype="订阅",
-                        title="【智能下载】已选用网盘资源",
+                        title=("【智能下载】订阅新增，已有网盘资源，已直接转存"
+                               if instant else "【智能下载】已选用网盘资源"),
                         text=(
                             f"{name}\n"
                             f"资源：{best.get('title')}\n"
@@ -1019,12 +1267,12 @@ class CloudSubscribePatch(_PluginBase):
                         ),
                     )
                 return
-            self._all_candidates_failed(key, name, sid, failures)
+            self._all_candidates_failed(key, name, sid, failures, instant=instant)
         except Exception as error:
             logger.error(f"【网盘订阅智能下载补丁】{name} 提交线程异常：{error}")
             # 异常也要收尾，否则窗口每轮巡检都会重试同一个坏候选
             failures.append(f"提交线程异常：{error}")
-            self._all_candidates_failed(key, name, sid, failures)
+            self._all_candidates_failed(key, name, sid, failures, instant=instant)
         finally:
             with self._lock:
                 current = self._windows.get(key)
@@ -1083,9 +1331,15 @@ class CloudSubscribePatch(_PluginBase):
 
     def _all_candidates_failed(
             self, key: str, name: str, sid: int,
-            failures: Optional[List[str]] = None
+            failures: Optional[List[str]] = None,
+            instant: bool = False
     ) -> None:
-        """候选全部转存失败：窗口还有时间就清空候选等下一轮，没时间就回归 PT。"""
+        """候选全部转存失败：窗口还有时间就清空候选等下一轮，没时间就回归 PT。
+
+        `instant=True` 表示这次是「订阅新增即时检索」，此时等待窗口根本还没开、
+        PT 也没命中过，谈不上「放弃网盘回归 PT」——什么都不做，等 PT 首次命中
+        资源时再照旧开窗比对即可。
+        """
         now = time.time()
         with self._lock:
             window = self._windows.get(key) or {}
@@ -1101,6 +1355,14 @@ class CloudSubscribePatch(_PluginBase):
             logger.info(
                 f"【网盘订阅智能下载补丁】{name} 候选全部转存失败，"
                 f"窗口内继续等待新的网盘资源"
+            )
+            return
+        if instant:
+            detail = "；".join((failures or [])[:3])
+            logger.info(
+                f"【网盘订阅智能下载补丁】{name} 即时检索候选全部转存失败，"
+                f"等 PT 首发后走等待对比"
+                + (f"（{detail}）" if detail else "")
             )
             return
         self._mark_released(key)
