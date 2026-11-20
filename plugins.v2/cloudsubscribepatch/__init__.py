@@ -177,7 +177,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.11"
+    plugin_version = "1.1.12"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -665,6 +665,12 @@ class CloudSubscribePatch(_PluginBase):
                 "description": "由本插件自己发一次 subscribe.added 事件，验证注册、派发与实例解析是否通畅",
             },
             {
+                "path": "/selftest",
+                "endpoint": self._api_selftest,
+                "methods": ["GET"],
+                "auth": "bear",
+            },
+            {
                 "path": "/handlers",
                 "endpoint": self._api_handlers,
                 "methods": ["GET"],
@@ -707,12 +713,28 @@ class CloudSubscribePatch(_PluginBase):
             "data": {"sent": True},
         }
 
+    def _api_selftest(self) -> dict:
+        """
+        直接调用事件处理函数，绕过事件总线：区分「事件没派发」和「派发了但没写日志」。
+        """
+        try:
+            self.on_subscribe_added(
+                Event(
+                    event_type=EventType.SubscribeAdded,
+                    event_data={"subscribe_id": 0, "probe": True},
+                )
+            )
+        except Exception as err:  # noqa: BLE001
+            return {"success": False, "message": f"调用异常：{err}"}
+        return {"success": True, "data": {"called": True}}
+
     def _api_handlers(self) -> dict:
         """
         回显事件总线里本插件相关 handler 的注册状态，用于排查事件不触发。
         """
         try:
             items = eventmanager.visualize_handlers()
+            unresolved = list(eventmanager.unresolved_handler_bindings())
         except Exception as err:  # noqa: BLE001
             return {"success": False, "message": f"取事件订阅失败：{err}"}
         wanted = {
