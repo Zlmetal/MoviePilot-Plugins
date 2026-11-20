@@ -177,7 +177,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.13"
+    plugin_version = "1.1.14"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -691,6 +691,8 @@ class CloudSubscribePatch(_PluginBase):
                     "dry_run": self._dry_run,
                     "wait_hours": self._wait_hours,
                     "prefer_stable_links": self._prefer_stable_links,
+                    "instant_search": self._instant_search,
+                    "event_trace": list(self._event_trace),
                     "windows": list(self._windows.values()),
                 },
             }
