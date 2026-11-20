@@ -177,7 +177,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.12"
+    plugin_version = "1.1.13"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -214,6 +214,8 @@ class CloudSubscribePatch(_PluginBase):
         self._released: Dict[str, float] = {}
         # 刚添加订阅的即时检索任务：sid -> {sid, started_at, finished_at}
         # 只存内存，重启丢失无妨（重启后 MP 的自动搜索会走常规等待流程）
+        # 最近收到的订阅新增事件（只存内存，用于诊断事件链路是否通）
+        self._event_trace: List[Dict[str, Any]] = []
         self._instant_tasks: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
@@ -734,7 +736,10 @@ class CloudSubscribePatch(_PluginBase):
         """
         try:
             items = eventmanager.visualize_handlers()
-            unresolved = list(eventmanager.unresolved_handler_bindings())
+            try:
+                unresolved = list(eventmanager.unresolved_handler_bindings())
+            except AttributeError:
+                unresolved = []
         except Exception as err:  # noqa: BLE001
             return {"success": False, "message": f"取事件订阅失败：{err}"}
         wanted = {
@@ -750,6 +755,7 @@ class CloudSubscribePatch(_PluginBase):
             "success": True,
             "data": {
                 "instant_search": self._instant_search,
+                "event_trace": list(self._event_trace),
                 "handlers": rows,
             },
         }
@@ -800,9 +806,17 @@ class CloudSubscribePatch(_PluginBase):
             f"【网盘订阅智能下载补丁】收到订阅新增事件：enabled={self._enabled} "
             f"dry_run={self._dry_run} instant={self._instant_search}"
         )
+        event_data = getattr(event, "event_data", None) or {}
+        trace = {
+            "at": datetime.now(pytz.timezone(settings.TZ)).strftime("%m-%d %H:%M:%S"),
+            "subscribe_id": event_data.get("subscribe_id"),
+            "username": event_data.get("username"),
+        }
+        self._event_trace.append(trace)
+        if len(self._event_trace) > 20:
+            del self._event_trace[: len(self._event_trace) - 20]
         if not self._enabled or self._dry_run or not self._instant_search:
             return
-        event_data = getattr(event, "event_data", None) or {}
         sid = 0
         try:
             raw = event_data.get("subscribe_id") or event_data.get("id")
