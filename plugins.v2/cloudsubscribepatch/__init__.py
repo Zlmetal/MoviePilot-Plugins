@@ -177,7 +177,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.7"
+    plugin_version = "1.1.8"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -656,6 +656,14 @@ class CloudSubscribePatch(_PluginBase):
                 "summary": "立即巡检一次",
                 "description": "手动触发一次网盘资源巡检",
             },
+            {
+                "path": "/handlers",
+                "endpoint": self._api_handlers,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "查看事件订阅状态",
+                "description": "返回本插件关注的广播事件在事件总线里的注册与启停状态",
+            },
         ]
 
     def _api_status(self) -> dict:
@@ -674,6 +682,32 @@ class CloudSubscribePatch(_PluginBase):
     def _api_check_now(self) -> dict:
         self._monitor_once()
         return {"success": True, "message": "巡检已执行"}
+
+    def _api_handlers(self) -> dict:
+        """
+        回显事件总线里本插件相关 handler 的注册状态，用于排查事件不触发。
+        """
+        try:
+            items = eventmanager.visualize_handlers()
+        except Exception as err:  # noqa: BLE001
+            return {"success": False, "message": f"取事件订阅失败：{err}"}
+        wanted = {
+            "subscribe.added",
+            "resource.download",
+        }
+        rows = [
+            item
+            for item in items
+            if item.get("event_type") in wanted
+            and "cloudsubscribepatch" in str(item.get("handler_identifier", "")).lower()
+        ]
+        return {
+            "success": True,
+            "data": {
+                "instant_search": self._instant_search,
+                "handlers": rows,
+            },
+        }
 
     # ------------------------------------------------------------------
     # 定时服务
