@@ -177,7 +177,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.14"
+    plugin_version = "1.1.15"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -809,14 +809,11 @@ class CloudSubscribePatch(_PluginBase):
             f"dry_run={self._dry_run} instant={self._instant_search}"
         )
         event_data = getattr(event, "event_data", None) or {}
-        trace = {
-            "at": datetime.now(pytz.timezone(settings.TZ)).strftime("%m-%d %H:%M:%S"),
-            "subscribe_id": event_data.get("subscribe_id"),
-            "username": event_data.get("username"),
-        }
-        self._event_trace.append(trace)
-        if len(self._event_trace) > 20:
-            del self._event_trace[: len(self._event_trace) - 20]
+        self._trace(
+            "event",
+            subscribe_id=event_data.get("subscribe_id"),
+            username=event_data.get("username"),
+        )
         if not self._enabled or self._dry_run or not self._instant_search:
             return
         sid = 0
@@ -833,6 +830,18 @@ class CloudSubscribePatch(_PluginBase):
             self._handle_subscribe_added(sid)
         except Exception as error:
             logger.error(f"【网盘订阅智能下载补丁】处理新增订阅事件异常：{error}")
+
+    def _trace(self, stage: str, **extra: Any) -> None:
+        """记录一条诊断轨迹（只存内存，最多 40 条），/status 可回读。"""
+        row = {
+            "at": datetime.now(pytz.timezone(settings.TZ)).strftime("%m-%d %H:%M:%S"),
+            "stage": stage,
+        }
+        row.update(extra)
+        with self._lock:
+            self._event_trace.append(row)
+            if len(self._event_trace) > 40:
+                del self._event_trace[: len(self._event_trace) - 40]
 
     def _handle_subscribe_added(self, sid: int) -> None:
         cloud = self._cloud_plugin()
@@ -872,9 +881,11 @@ class CloudSubscribePatch(_PluginBase):
         try:
             cloud = self._cloud_plugin()
             if not cloud:
+                self._trace("instant_no_cloud", sid=sid)
                 return
             subscribe = self._get_subscribe(sid)
             if not subscribe:
+                self._trace("instant_no_subscribe", sid=sid)
                 logger.info(
                     f"【网盘订阅智能下载补丁】订阅 {sid} 已不存在，跳过即时检索"
                 )
@@ -882,6 +893,7 @@ class CloudSubscribePatch(_PluginBase):
             name = str(getattr(subscribe, "name", "") or key)
             media_type = self._media_type(getattr(subscribe, "type", None))
             if media_type is None:
+                self._trace("instant_no_media_type", sid=sid)
                 return
             season = int(getattr(subscribe, "season", 1) or 1)
             # 剧集只追还没入库的集：已入库的集不再重复请求网盘
@@ -890,6 +902,7 @@ class CloudSubscribePatch(_PluginBase):
             if media_type == MediaType.TV:
                 missing = self._instant_missing_episodes(cloud, subscribe)
                 if missing is not None and not missing:
+                    self._trace("instant_no_missing", sid=sid, name=name)
                     logger.info(
                         f"【网盘订阅智能下载补丁】{name} 当前没有缺集，跳过即时检索"
                     )
@@ -903,6 +916,7 @@ class CloudSubscribePatch(_PluginBase):
                 "instant": True,
                 "opened_by": "订阅新增即时检索",
             }
+            self._trace("instant_search_start", sid=sid, name=name, missing=missing)
             candidates = self._search_cloud(cloud, subscribe, window)
             # 磁力/PT 类候选本来就能直接下，即时检索只处理网盘
             candidates = [
@@ -910,6 +924,7 @@ class CloudSubscribePatch(_PluginBase):
                 if int(item.get("tier") if item.get("tier") is not None else 2) < 2
             ]
             if not candidates:
+                self._trace("instant_no_candidate", sid=sid, name=name)
                 logger.info(
                     f"【网盘订阅智能下载补丁】{name} 即时检索未搜到网盘资源，"
                     f"等 PT 首发后走等待对比"
@@ -918,6 +933,7 @@ class CloudSubscribePatch(_PluginBase):
             self._share_budget = _SHARE_CHECK_BUDGET
             alive = self._verify_candidates(cloud, candidates)
             if not alive:
+                self._trace("instant_all_dead", sid=sid, name=name)
                 logger.info(
                     f"【网盘订阅智能下载补丁】{name} 即时检索到的分享均已失效，"
                     f"等 PT 首发后走等待对比"
@@ -937,8 +953,13 @@ class CloudSubscribePatch(_PluginBase):
                 f"【网盘订阅智能下载补丁】{name} 订阅新增即时检索命中："
                 f"{best.get('title')}（{best.get('tier_text')}，评分 {best.get('score')}），直接提交"
             )
+            self._trace(
+                "instant_submit", sid=sid, name=name,
+                best=best.get("title"), score=best.get("score"),
+            )
             self._submit_worker(window, cloud, list(ranked), name, sid)
         except Exception as error:
+            self._trace("instant_error", sid=sid, name=name, error=str(error))
             logger.error(f"【网盘订阅智能下载补丁】{name} 即时检索异常：{error}")
         finally:
             with self._lock:
