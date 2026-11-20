@@ -177,7 +177,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.10"
+    plugin_version = "1.1.11"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -691,20 +691,20 @@ class CloudSubscribePatch(_PluginBase):
         self._monitor_once()
         return {"success": True, "message": "巡检已执行"}
 
-    def _api_probe_event(self, sid: int = 0) -> dict:
+    def _api_probe_event(self) -> dict:
         """
         自测事件链路：自己发一次 broadcast 事件，看处理器是否被调用。
         """
         try:
             eventmanager.send_event(
                 EventType.SubscribeAdded,
-                {"subscribe_id": int(sid or 0), "probe": True},
+                {"subscribe_id": 0, "probe": True},
             )
         except Exception as err:  # noqa: BLE001
             return {"success": False, "message": f"发送失败：{err}"}
         return {
             "success": True,
-            "data": {"sent": True, "sid": int(sid or 0)},
+            "data": {"sent": True},
         }
 
     def _api_handlers(self) -> dict:
