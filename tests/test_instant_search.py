@@ -194,10 +194,14 @@ class InstantSearchTest(unittest.TestCase):
         self.assertEqual(calls, [], "没有缺集时不应发起检索")
         self.assertEqual(self.submitted, [])
 
-    def test_magnet_candidates_filtered(self):
-        """磁力/PT 类候选不进即时检索（它们本来就能直接下）。"""
+    def test_pure_pt_candidates_filtered(self):
+        """纯 PT 候选不进即时检索（它们本来就能直接下）。
+
+        注意：磁力/电驴在开启「把磁力/电驴纳入网盘渠道」后是 tier=1.5，
+        属于网盘渠道，不再被这道过滤挡掉——见 test_offline.py。
+        """
         self.plugin._search_cloud = lambda *a, **k: [
-            make_candidate("磁力 4K", 99, tier=2, url="magnet:?xt=1"),
+            make_candidate("PT 4K", 99, tier=2, url="https://pt.example/x"),
         ]
         self.plugin._instant_worker(12)
         self.assertEqual(self.submitted, [])

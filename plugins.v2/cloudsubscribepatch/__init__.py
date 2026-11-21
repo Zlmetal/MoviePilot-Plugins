@@ -22,12 +22,20 @@ PT 站的新片首发资源质量普遍一般（多为 1080P WEB-DL 甚至 HDTV�
 
 候选优先级
 ----------
-同一轮里按「无需解锁的网盘资源 > 需解锁的网盘资源 > PT 资源」三级排序：
-网盘候选先比这一层级，再比画质评分；只要窗口内有任何网盘候选，
-就不会放行 PT。层级只看「能不能直接拿到链接」：网盘分享直链＝0，
+同一轮里按「无需解锁的网盘资源 > 需解锁的网盘资源 > 磁力/电驴离线 >
+PT 资源」排序：候选先比这一层级，再比画质评分；只要窗口内有任何网盘
+或离线候选，就不会放行 PT。层级：网盘分享直链＝0，
 需积分解锁（need_unlock）或免费待领取（need_access）＝1，
-磁力/ed2k 这类要下载器去拖的＝2。
+磁力/ed2k/种子这类交给 115 离线下载的＝1.5，纯 PT＝2。
 评分仍按画质/来源/中字/音轨累积。
+
+网盘转存与离线下载的区别
+------------------------
+* 分享转存：直接交给「网盘订阅助手」的同步链，落到它配置的网盘转存路径
+  （本插件不碰路径）；
+* 磁力/电驴离线：先提交到本插件自己设置的「离线中转目录」（留空则沿用
+  上游保存路径），由本插件自己轮询离线任务；确认下载完成后把文件移动到
+  上游保存路径，并补写一条 MP 下载历史，好让 MoviePilot 照常整理入库。
 
 分享链接有效性
 --------------
@@ -41,6 +49,7 @@ pansou 这类聚合源给的都是别人的第三方分享，等待期内经常�
 两个插件任一未启用时本插件自动放行，不做任何拦截。
 """
 
+import hashlib
 import re
 import threading
 import time
@@ -87,6 +96,20 @@ _INSTANT_DEDUP_SECONDS = 10 * 60
 # 也别好不容等到期才发现链接早被人删了。
 _FRAGILE_SOURCES = frozenset({"pansou"})
 _FRAGILE_RANK = 1.9              # 落在「需解锁网盘(1)」与「PT(2)」之间的档位
+
+# 磁力/电驴：交给网盘的离线下载去拖，比 PT 稳（有源就能下完、不占下载器），
+# 但比直链慢（要等下载完成），所以单独占一档，排在需解锁网盘之后、PT 之前。
+_OFFLINE_TIER = 1.5
+# 离线任务轮询：前 30 分钟每 2 分钟看一次，之后每 10 分钟，
+# 超过上限就放弃（默认 6 小时），免得一条死链占着中转目录不放。
+_OFFLINE_POLL_FAST_SECONDS = 2 * 60
+_OFFLINE_POLL_FAST_UNTIL = 30 * 60
+_OFFLINE_POLL_SLOW_SECONDS = 10 * 60
+# 单条离线任务的等待上限。上游 postprocess 里默认只等 30 分钟，
+# 磁力冷门资源常常要拖很久，这里放宽到 6 小时，超时才放弃。
+_OFFLINE_GIVE_UP_SECONDS = 6 * 60 * 60
+# 离线任务的持久化 key（重启后继续等，不重复提交）
+_OFFLINE_TASKS_KEY = "offline_tasks"
 
 # 提交后确认：网盘订阅助手的 start_selected_resources 只是把候选塞进队列就
 # 返回 success，真正的转存失败（分享在提交瞬间被人取消）发生在几十秒之后。
@@ -177,7 +200,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.15"
+    plugin_version = "1.1.16"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -202,6 +225,9 @@ class CloudSubscribePatch(_PluginBase):
     _dry_run: bool = False
     _prefer_stable_links: bool = True
     _instant_search: bool = True
+    # 磁力/电驴离线：离线任务先落到自建中转目录，下完再由本插件搬到上游保存目录
+    _offline_enabled: bool = True
+    _offline_staging_path: str = ""
 
     def __init__(self):
         super().__init__()
@@ -217,6 +243,8 @@ class CloudSubscribePatch(_PluginBase):
         # 最近收到的订阅新增事件（只存内存，用于诊断事件链路是否通）
         self._event_trace: List[Dict[str, Any]] = []
         self._instant_tasks: Dict[str, Dict[str, Any]] = {}
+        # 在等的离线任务：pending_key -> 任务上下文（重启后从持久化恢复）
+        self._offline_tasks: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -247,14 +275,22 @@ class CloudSubscribePatch(_PluginBase):
         )
         self._prefer_stable_links = bool(config.get("prefer_stable_links", True))
         self._instant_search = bool(config.get("instant_search", True))
+        self._offline_enabled = bool(config.get("offline_enabled", True))
+        self._offline_staging_path = str(
+            config.get("offline_staging_path") or ""
+        ).strip().rstrip("/")
         self._notify = bool(config.get("notify", True))
         self._dry_run = bool(config.get("dry_run"))
 
         # 载入持久化的等待窗口
         saved = self.get_data(_DATA_KEY)
         released = self.get_data(_RELEASED_KEY)
+        pending_offline = self.get_data(_OFFLINE_TASKS_KEY)
         with self._lock:
             self._windows = dict(saved) if isinstance(saved, dict) else {}
+            self._offline_tasks = (
+                dict(pending_offline) if isinstance(pending_offline, dict) else {}
+            )
             self._released = (
                 {str(k): float(v) for k, v in released.items() if v}
                 if isinstance(released, dict) else {}
@@ -264,13 +300,16 @@ class CloudSubscribePatch(_PluginBase):
             self._released = {
                 key: until for key, until in self._released.items() if until > now
             }
-
         if self._enabled:
             logger.info(
                 f"【网盘订阅智能下载补丁】已启用：等待 {self._wait_hours} 小时，"
                 f"每 {self._check_interval_minutes} 分钟巡检，"
                 f"策略 {self._submit_policy}，"
                 f"当前等待窗口 {len(self._windows)} 个"
+                + (
+                    f"，离线中转目录 {self._offline_staging_path}（待轮询 {len(self._offline_tasks)} 个）"
+                    if self._offline_enabled else "，离线下载已关闭"
+                )
                 + ("，干跑模式" if self._dry_run else "")
             )
         else:
@@ -562,6 +601,44 @@ class CloudSubscribePatch(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "offline_enabled",
+                                            "label": "把磁力/电驴纳入网盘渠道",
+                                            "hint": "开启后磁力、电驴、种子链接交给 115 离线下载去拖，"
+                                                    "排在「需解锁网盘」之后、PT 之前；分享转存不受影响，仍走原保存目录",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "offline_staging_path",
+                                            "label": "离线中转目录",
+                                            "placeholder": "/离线中转",
+                                            "hint": "离线任务先下载到这里，确认完成后本插件再搬到上面「网盘订阅助手」设置的保存目录。"
+                                                    "留空则直接下到保存目录（等同原行为）。注意要填 115 网盘里的绝对路径",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -579,7 +656,11 @@ class CloudSubscribePatch(_PluginBase):
                                                 "开启「订阅新增时立即检索网盘」后，新加的订阅会先即时搜一次："
                                                 "已有网盘资源就按评分直接转存最优候选，不必等 PT 首发；"
                                                 "没搜到才进入上面的等待对比流程。剧集按集粒度处理，"
-                                                "已入库的集不重复追，后续新集仍走等待对比。"
+                                                "已入库的集不重复追，后续新集仍走等待对比。\n"
+                                                "开启「把磁力/电驴纳入网盘渠道」后，磁力、电驴、种子链接"
+                                                "会交给 115 离线下载，排在需解锁网盘之后、PT 之前；"
+                                                "离线任务先下到「离线中转目录」，确认下完再由本插件搬到"
+                                                "「网盘订阅助手」的保存目录，并补一条下载历史。"
                                             ),
                                         },
                                     }
@@ -604,6 +685,8 @@ class CloudSubscribePatch(_PluginBase):
             "max_unlock_points": 0,
             "prefer_stable_links": True,
             "instant_search": True,
+            "offline_enabled": True,
+            "offline_staging_path": "",
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -692,6 +775,9 @@ class CloudSubscribePatch(_PluginBase):
                     "wait_hours": self._wait_hours,
                     "prefer_stable_links": self._prefer_stable_links,
                     "instant_search": self._instant_search,
+                    "offline_enabled": self._offline_enabled,
+                    "offline_staging_path": self._offline_staging_path,
+                    "offline_tasks": list(self._offline_tasks.values()),
                     "event_trace": list(self._event_trace),
                     "windows": list(self._windows.values()),
                 },
@@ -775,8 +861,29 @@ class CloudSubscribePatch(_PluginBase):
                 "trigger": IntervalTrigger(minutes=self._check_interval_minutes),
                 "func": self._monitor_once,
                 "kwargs": {},
-            }
+            },
+            {
+                # 离线任务要盯得勤一点：等待窗口按小时巡检，
+                # 但离线任务下完就该马上搬走，不能等一小时
+                "id": "CloudSubscribePatch_Offline",
+                "name": "网盘离线任务巡检",
+                "trigger": IntervalTrigger(minutes=2),
+                "func": self._offline_tick,
+                "kwargs": {},
+            },
         ]
+
+    def _offline_tick(self):
+        """只轮询离线任务的轻量巡检（每 2 分钟）。"""
+        if not self._enabled or not self._offline_tasks:
+            return
+        cloud = self._cloud_plugin()
+        if not cloud:
+            return
+        try:
+            self._poll_offline_tasks(cloud)
+        except Exception as error:
+            logger.error(f"【网盘订阅智能下载补丁】离线任务巡检失败：{error}")
 
     # ------------------------------------------------------------------
     # 事件：拦下 PT 下载
@@ -918,10 +1025,10 @@ class CloudSubscribePatch(_PluginBase):
             }
             self._trace("instant_search_start", sid=sid, name=name, missing=missing)
             candidates = self._search_cloud(cloud, subscribe, window)
-            # 磁力/PT 类候选本来就能直接下，即时检索只处理网盘
+            # 纯 PT 类候选本来就能直接下，即时检索只处理网盘/离线
             candidates = [
                 item for item in candidates
-                if int(item.get("tier") if item.get("tier") is not None else 2) < 2
+                if self._tier_of(item) < 2
             ]
             if not candidates:
                 self._trace("instant_no_candidate", sid=sid, name=name)
@@ -1162,11 +1269,18 @@ class CloudSubscribePatch(_PluginBase):
         cloud = self._cloud_plugin()
         with self._lock:
             keys = list(self._windows.keys())
-        if not keys:
+            has_offline = bool(self._offline_tasks)
+        if not keys and not has_offline:
             return
         if not cloud:
             logger.warning("【网盘订阅智能下载补丁】未找到「网盘订阅助手」实例，本次巡检跳过")
             return
+
+        # 离线任务先查：它们自己按 next_check_at 排期，跟等待窗口无关
+        try:
+            self._poll_offline_tasks(cloud)
+        except Exception as error:
+            logger.error(f"【网盘订阅智能下载补丁】离线任务巡检失败：{error}")
 
         now = time.time()
         for key in keys:
@@ -1201,10 +1315,10 @@ class CloudSubscribePatch(_PluginBase):
             return
 
         candidates = self._search_cloud(cloud, subscribe, window)
-        # 磁力/PT 类候选本来就能直接下，没必要等窗口、也不进备选
+        # 纯 PT 类候选本来就能直接下，没必要等窗口、也不进备选
         candidates = [
             item for item in candidates
-            if int(item.get("tier") if item.get("tier") is not None else 2) < 2
+            if self._tier_of(item) < 2
         ]
         if not candidates:
             logger.info(f"【网盘订阅智能下载补丁】{window.get('name')} 本次未搜到可用网盘资源")
@@ -1332,13 +1446,40 @@ class CloudSubscribePatch(_PluginBase):
                 tier = best.get("tier")
                 if tier is None:
                     tier = self._candidate_tier(resource)
-                if int(tier) >= 2:
-                    # 磁力/PT 类候选不交给网盘链：PT 本来就能直接下
+                if float(tier) >= 2:
+                    # 纯 PT 候选不交给网盘链：PT 本来就能直接下
                     logger.info(
                         f"【网盘订阅智能下载补丁】{name} 跳过第 {index + 1} 名"
                         f"（{best.get('tier_text') or 'PT'}），保留 PT 直下更省事"
                     )
                     continue
+                if float(tier) == _OFFLINE_TIER:
+                    # 磁力/电驴：不交给上游同步链，直接进 115 离线下载，
+                    # 先落到本插件的中转目录，由本插件自己轮询、
+                    # 下完搬到上游保存目录，再补一条 MP 下载历史。
+                    submitted, detail = self._submit_offline(
+                        cloud, sid, window, best, resource, name
+                    )
+                    if not submitted:
+                        failures.append(f"{best.get('title')}：{detail}")
+                        continue
+                    self._close_window(key)
+                    if self._notify:
+                        self.post_message(
+                            mtype="订阅",
+                            title=("【智能下载】订阅新增，已提交网盘离线下载"
+                                   if instant else "【智能下载】已提交网盘离线下载"),
+                            text=(
+                                f"{name}\n"
+                                f"资源：{best.get('title')}\n"
+                                f"来源：{best.get('source') or '网盘'}"
+                                f"（{best.get('tier_text') or ''}）\n"
+                                f"评分：{best.get('score')}\n"
+                                f"文件大小：{best.get('size_text') or '未知'}\n"
+                                f"状态：{detail}"
+                            ),
+                        )
+                    return
                 # 只有当它真排到前面、马上要提交了，才花积分/领链接；
                 # 搜索与比价阶段全程不解锁。
                 if best.get("need_unlock"):
@@ -1452,6 +1593,341 @@ class CloudSubscribePatch(_PluginBase):
         ):
             return True, message
         return False, message or "未转存任何文件"
+
+    # ------------------------------------------------------------------
+    # 磁力/电驴离线下载
+    # ------------------------------------------------------------------
+    def _offline_download_service(self, cloud: Any) -> Optional[Any]:
+        """取上游的 115 离线下载能力（`OfflineDownloadOperations`）。"""
+        for holder in (getattr(cloud, "_sync_handler", None), cloud):
+            service = getattr(holder, "_offline_download", None) if holder else None
+            if service and callable(getattr(service, "add_offline_download", None)):
+                return service
+        return None
+
+    @staticmethod
+    def _offline_hash(url: str) -> str:
+        """取磁力/电驴链接的 info_hash，统一 32/40 位大写十六进制。"""
+        raw = str(url or "").strip()
+        if not raw:
+            return ""
+        try:
+            from app.plugins.cloudsubscribe.drive.p115.offline import P115OfflineDownload
+            info = (
+                P115OfflineDownload.parse_ed2k_link(raw)
+                if raw.lower().startswith("ed2k://")
+                else P115OfflineDownload.parse_magnet_link(raw)
+            )
+            if info and info.get("hash"):
+                return str(info["hash"]).upper()
+        except Exception:
+            pass
+        try:
+            from app.plugins.cloudsubscribe.utils.magnet import extract_magnet_hash
+            return str(extract_magnet_hash(raw) or "").upper()
+        except Exception:
+            return ""
+
+    def _offline_upstream_path(self, cloud: Any) -> str:
+        """上游「网盘订阅助手」配置的保存目录（分享转存与离线共用的那个）。"""
+        handler = getattr(cloud, "_sync_handler", None)
+        for holder in (handler, cloud):
+            if not holder:
+                continue
+            for name in ("_cloud_transfer_path", "cloud_transfer_path"):
+                value = getattr(holder, name, None)
+                if value:
+                    return str(value).strip().rstrip("/") or "/"
+        return "/待整理"
+
+    def _submit_offline(
+            self, cloud: Any, sid: int, window: Dict[str, Any],
+            best: Dict[str, Any], resource: Dict[str, Any], name: str
+    ) -> Tuple[bool, str]:
+        """把磁力/电驴丢进 115 离线下载，落到本插件的中转目录。
+
+        离线任务提交后立刻进 `self._offline_tasks` 持久化，由巡检线程
+        `_poll_offline_tasks` 决定什么时候搬到上游保存目录。
+        """
+        service = self._offline_download_service(cloud)
+        if not service:
+            return False, "网盘订阅助手没有提供离线下载能力"
+        url = str(resource.get("url") or "").strip()
+        if not url:
+            return False, "候选没有离线链接"
+        title = str(best.get("title") or "").strip()
+        staging = self._offline_staging_path or self._offline_upstream_path(cloud)
+        try:
+            # 平台文件名只对单文件 ed2k 有意义；磁力是整包，交给网盘自己命名
+            target_name = None
+            if url.lower().startswith("ed2k://"):
+                target_name = title or None
+            submitted = service.add_offline_download(url, staging, target_name=target_name)
+        except Exception as error:
+            return False, f"提交离线下载异常：{error}"
+        if not submitted:
+            return False, "115 离线下载未接受该任务（可能非会员或链接无效）"
+        digest = self._offline_hash(url) or hashlib.md5(url.encode("utf-8")).hexdigest().upper()
+        pending_key = f"offline:{digest}:{sid}"
+        now = time.time()
+        record = {
+            "pending_key": pending_key,
+            "sid": sid,
+            "name": name,
+            "title": title,
+            "url": url,
+            "hash": digest,
+            "staging": staging,
+            "upstream": self._offline_upstream_path(cloud),
+            "season": window.get("season"),
+            "episodes": list(window.get("episodes") or []),
+            "media_type": str(window.get("type") or ""),
+            "submitted_at": now,
+            "next_check_at": now + _OFFLINE_POLL_FAST_SECONDS,
+            "checks": 0,
+        }
+        with self._lock:
+            self._offline_tasks[pending_key] = record
+            self._persist()
+        logger.info(
+            f"【网盘订阅智能下载补丁】{name} 离线任务已提交：{title} → {staging}"
+            f"（下完搬到 {record['upstream']}）"
+        )
+        return True, f"已提交 115 离线下载，暂存于 {staging}，完成后自动移至 {record['upstream']}"
+
+    def _poll_offline_tasks(self, cloud: Any) -> None:
+        """巡检在等的离线任务：完成就搬到上游保存目录，失败就认栽。"""
+        if not self._offline_tasks:
+            return
+        now = time.time()
+        with self._lock:
+            keys = [
+                key for key, item in self._offline_tasks.items()
+                if float(item.get("next_check_at") or 0) <= now
+            ]
+        for key in keys:
+            with self._lock:
+                record = dict(self._offline_tasks.get(key) or {})
+            if not record:
+                continue
+            try:
+                self._check_offline_task(cloud, key, record)
+            except Exception as error:
+                logger.error(
+                    f"【网盘订阅智能下载补丁】离线任务 {record.get('title')} 巡检失败：{error}"
+                )
+
+    def _check_offline_task(
+            self, cloud: Any, key: str, record: Dict[str, Any]
+    ) -> None:
+        tasks_service = None
+        handler = getattr(cloud, "_sync_handler", None)
+        for holder in (handler, cloud):
+            if not holder:
+                continue
+            candidate = getattr(holder, "_offline_tasks", None)
+            if candidate and callable(getattr(candidate, "get_offline_task_list_snapshot", None)):
+                tasks_service = candidate
+                break
+        digest = str(record.get("hash") or "").upper()
+        task: Dict[str, Any] = {}
+        if tasks_service:
+            snapshot = tasks_service.get_offline_task_list_snapshot(force=True) or {}
+            for item in snapshot.get("tasks") or []:
+                if str(item.get("id") or "").upper() == digest:
+                    task = dict(item)
+                    break
+        title = record.get("title") or record.get("name")
+        if not task:
+            # 网盘那边还没列出来（刚提交时有延迟），继续等
+            self._reschedule_offline(key, record, now=None)
+            return
+        if task.get("failed"):
+            logger.info(
+                f"【网盘订阅智能下载补丁】离线任务失败，放弃：{title}"
+                f"（{task.get('status_text') or '下载失败'}）"
+            )
+            self._drop_offline(key, notify_text=(
+                f"{record.get('name')}\n离线资源：{title}\n"
+                f"结果：115 离线下载失败（{task.get('status_text') or '下载失败'}），已放弃"
+            ))
+            return
+        if not task.get("completed"):
+            percent = task.get("percent") or 0
+            logger.debug(
+                f"【网盘订阅智能下载补丁】离线任务进度：{title} {percent}%"
+            )
+            self._reschedule_offline(key, record, now=None)
+            return
+        # 下载完成 → 搬到上游保存目录
+        moved, detail = self._relocate_offline(cloud, record, task)
+        if moved:
+            self._drop_offline(key, notify_text=(
+                f"{record.get('name')}\n离线资源：{title}\n"
+                f"结果：离线下载完成，已移至 {record.get('upstream')}\n"
+                f"接下来由 MoviePilot 照常整理入库"
+            ))
+        else:
+            logger.warning(
+                f"【网盘订阅智能下载补丁】离线文件搬迁未成功（{detail}），稍后再试：{title}"
+            )
+            self._reschedule_offline(key, record, now=time.time())
+
+    _VIDEO_SUFFIXES = frozenset({
+        "mkv", "mp4", "ts", "avi", "m2ts", "mov", "wmv", "rmvb", "flv", "iso",
+    })
+
+    def _offline_staging_files(
+            self, query: Any, task: Dict[str, Any], staging: str
+    ) -> List[Any]:
+        """列出离线任务在中转目录里的文件：优先按任务精确定位，退回落目录扫。"""
+        files: List[Any] = []
+        try:
+            files = query.list_offline_task_files(task, staging) or []
+        except Exception as error:
+            logger.debug(f"【网盘订阅智能下载补丁】按任务定位离线文件失败：{error}")
+        if files:
+            return list(files)
+        return list(query.list_files_recursive(staging, max_depth=6) or [])
+
+    def _offline_videos(self, files: List[Any]) -> List[Any]:
+        """只挑视频文件；目录、字幕、样片一律跳过。"""
+        videos: List[Any] = []
+        for item in files or []:
+            if not item or getattr(item, "is_directory", False):
+                continue
+            name = str(getattr(item, "name", "") or "")
+            if "." not in name:
+                continue
+            if name.rsplit(".", 1)[-1].lower() in self._VIDEO_SUFFIXES:
+                videos.append(item)
+        return videos
+
+    def _relocate_offline(
+            self, cloud: Any, record: Dict[str, Any], task: Dict[str, Any]
+    ) -> Tuple[bool, str]:
+        """把已下完的离线文件从中转目录搬到上游保存目录，并补写下载历史。"""
+        handler = getattr(cloud, "_sync_handler", None)
+        query = getattr(handler, "_cloud_query", None) if handler else None
+        mutations = getattr(handler, "_cloud_mutations", None) if handler else None
+        if not query or not mutations:
+            return False, "网盘订阅助手没有提供文件查询/移动能力"
+        staging = str(record.get("staging") or "/").rstrip("/") or "/"
+        upstream = str(record.get("upstream") or "/").rstrip("/") or "/"
+        if staging == upstream:
+            # 没配中转目录（或配成同一个）：文件本来就在保存目录里，
+            # 只补下载历史，别自己搬自己
+            files = self._offline_staging_files(query, task, staging)
+            videos = self._offline_videos(files)
+            for item in videos:
+                self._record_offline_history(
+                    cloud, record, upstream, str(getattr(item, "name", "") or "")
+                )
+            return (bool(videos), f"文件已在 {upstream}，已补下载历史"
+                    if videos else "中转目录里还没有视频文件")
+        try:
+            files = self._offline_staging_files(query, task, staging)
+        except Exception as error:
+            return False, f"列目录失败：{error}"
+        videos = self._offline_videos(files)
+        if not videos:
+            return False, "中转目录里还没有视频文件"
+        moved_count = 0
+        for item in videos:
+            file_name = str(getattr(item, "name", "") or "")
+            try:
+                result = mutations.move_file(item, upstream, file_name)
+            except Exception as error:
+                logger.warning(
+                    f"【网盘订阅智能下载补丁】移动 {file_name} 失败：{error}"
+                )
+                continue
+            if result:
+                moved_count += 1
+                self._record_offline_history(cloud, record, upstream, file_name)
+        if not moved_count:
+            return False, "一个文件都没搬过去"
+        logger.info(
+            f"【网盘订阅智能下载补丁】离线文件已搬到 {upstream}："
+            f"{moved_count} 个（{record.get('title')}）"
+        )
+        return True, f"已移动 {moved_count} 个文件"
+
+    def _record_offline_history(
+            self, cloud: Any, record: Dict[str, Any],
+            path: str, file_name: str
+    ) -> None:
+        """补一条 MP 下载历史，让 MoviePilot 认得出这条已经下过。"""
+        handler = getattr(cloud, "_sync_handler", None)
+        recorder = getattr(handler, "_record_download_history", None) if handler else None
+        if not callable(recorder):
+            logger.debug("【网盘订阅智能下载补丁】上游没有暴露下载历史记录能力，跳过")
+            return
+        sid = int(record.get("sid") or 0)
+        subscribe = self._get_subscribe(sid)
+        if not subscribe:
+            logger.debug("【网盘订阅智能下载补丁】订阅已不存在，跳过下载历史补写")
+            return
+        media_type = self._media_type(record.get("media_type")) or getattr(
+            subscribe, "type", None
+        )
+        try:
+            mediainfo = handler._subscribe_mediainfo(subscribe, media_type)
+        except Exception as error:
+            logger.debug(f"【网盘订阅智能下载补丁】取媒体信息失败：{error}")
+            return
+        if not mediainfo:
+            return
+        try:
+            recorder(
+                mediainfo=mediainfo,
+                subscribe=subscribe,
+                path=path,
+                download_hash=str(record.get("hash") or ""),
+                torrent_name=str(record.get("title") or file_name),
+                share_url=str(record.get("url") or ""),
+                torrent_description=file_name,
+            )
+        except Exception as error:
+            logger.warning(f"【网盘订阅智能下载补丁】补写下载历史失败：{error}")
+
+    def _reschedule_offline(
+            self, key: str, record: Dict[str, Any], now: Optional[float]
+    ) -> None:
+        now = time.time() if now is None else float(now)
+        checks = int(record.get("checks") or 0) + 1
+        elapsed = now - float(record.get("submitted_at") or now)
+        if elapsed >= _OFFLINE_GIVE_UP_SECONDS:
+            logger.info(
+                f"【网盘订阅智能下载补丁】离线任务超时放弃：{record.get('title')}"
+            )
+            self._drop_offline(key, notify_text=(
+                f"{record.get('name')}\n离线资源：{record.get('title')}\n"
+                f"结果：离线下载超过 {_OFFLINE_GIVE_UP_SECONDS // 3600} 小时仍未完成，已放弃"
+            ))
+            return
+        interval = (
+            _OFFLINE_POLL_FAST_SECONDS
+            if elapsed < _OFFLINE_POLL_FAST_UNTIL
+            else _OFFLINE_POLL_SLOW_SECONDS
+        )
+        with self._lock:
+            current = self._offline_tasks.get(key)
+            if current is not None:
+                current["checks"] = checks
+                current["next_check_at"] = now + interval
+                self._persist()
+
+    def _drop_offline(self, key: str, notify_text: str = "") -> None:
+        with self._lock:
+            self._offline_tasks.pop(key, None)
+            self._persist()
+        if notify_text and self._notify:
+            self.post_message(
+                mtype="订阅",
+                title="【智能下载】离线下载结果",
+                text=notify_text,
+            )
 
     def _all_candidates_failed(
             self, key: str, name: str, sid: int,
@@ -1640,26 +2116,27 @@ class CloudSubscribePatch(_PluginBase):
             )
         return scored
 
-    @staticmethod
-    def _candidate_tier(item: Any) -> int:
-        """候选层级：0=直接可用的网盘直链，1=需解锁网盘，2=磁力/PT 资源。
+    def _candidate_tier(self, item: Any) -> float:
+        """候选层级：0=直接可用的网盘直链，1=需解锁网盘，2=纯 PT 资源。
 
-        只看「能不能直接拿到链接」：磁力、ed2k 属于要下载器去拖的 PT 类资源，
-        网盘分享链接才是直链；没有直链但可花积分解锁的算中间层。
+        磁力/ed2k/种子交给网盘的离线下载去拖：比 PT 稳（有源就能下完、
+        不占下载器），但比直链慢（要等下载完成），所以占 1.5 这一档，
+        排在「需解锁网盘」之后、PT 之前。关掉「把磁力/电驴纳入网盘渠道」
+        后它们退回 2，也就是原来的「保留 PT 直下更省事」。
         """
         if not isinstance(item, dict):
-            return 2
+            return 2.0
         resource_type = str(item.get("resource_type") or "").strip().lower()
         if resource_type in {"magnet", "ed2k", "torrent"}:
-            return 2
+            return _OFFLINE_TIER if self._offline_enabled else 2.0
         url = str(item.get("url") or "").strip().lower()
         if url.startswith("magnet:") or url.startswith("ed2k://"):
-            return 2
+            return _OFFLINE_TIER if self._offline_enabled else 2.0
         if url:
-            return 0
+            return 0.0
         # need_unlock=花积分解锁；need_access=免费但要点开页面领取，
         # 两者都没有直链、都要先走一次解锁链，同属中间层
-        return 1 if (item.get("need_unlock") or item.get("need_access")) else 2
+        return 1.0 if (item.get("need_unlock") or item.get("need_access")) else 2.0
 
     def _candidate_rank(self, candidate: Dict[str, Any]) -> float:
         """候选的排序档位（浮点）：0=直链，1=需解锁，1.9=短效直链，2=PT.
@@ -1679,10 +2156,21 @@ class CloudSubscribePatch(_PluginBase):
         if tier is None:
             tier = 2
         try:
-            tier = int(tier)
+            tier = float(tier)
         except (TypeError, ValueError):
-            tier = 2
-        return float(tier)
+            tier = 2.0
+        return tier
+
+    @staticmethod
+    def _tier_of(candidate: Dict[str, Any]) -> float:
+        """取候选层级（浮点），缺省按纯 PT 处理。"""
+        tier = candidate.get("tier")
+        if tier is None:
+            return 2.0
+        try:
+            return float(tier)
+        except (TypeError, ValueError):
+            return 2.0
 
     def _candidate_sort_key(self, candidate: Dict[str, Any]) -> tuple:
         """先按档位、再按评分——档位压过分数，保证「无需解锁 > 需解锁 > PT」."""
@@ -1855,6 +2343,8 @@ class CloudSubscribePatch(_PluginBase):
             tier_text = "网盘直链（短效分享）"
         elif tier == 1:
             tier_text = "需解锁网盘" if unlock else "免费领取网盘"
+        elif tier == _OFFLINE_TIER:
+            tier_text = "磁力/电驴离线"
         else:
             tier_text = {0: "网盘直链", 2: "PT / 其他"}.get(tier, "其他")
         return {
@@ -1932,9 +2422,11 @@ class CloudSubscribePatch(_PluginBase):
             value = dict(item)
             snapshot[key] = value
         released = {key: float(until) for key, until in self._released.items()}
+        offline = {key: dict(item) for key, item in self._offline_tasks.items()}
         try:
             self.save_data(_DATA_KEY, snapshot)
             self.save_data(_RELEASED_KEY, released)
+            self.save_data(_OFFLINE_TASKS_KEY, offline)
         except Exception as error:
             logger.debug(f"【网盘订阅智能下载补丁】持久化等待窗口失败：{error}")
 
