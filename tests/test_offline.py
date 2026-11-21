@@ -252,5 +252,80 @@ class PollOfflineTest(unittest.TestCase):
         self.assertEqual(self.plugin._offline_tasks, {}, "超时该放弃")
 
 
+class DeferredResolveTest(unittest.TestCase):
+    """聚影这类渠道列表模式只回 resource_id、不回链接，不能当空壳丢掉。"""
+
+    def setUp(self):
+        self.plugin = csp.CloudSubscribePatch()
+        self.plugin._enabled = True
+        self.plugin._notify = False
+        self.plugin._offline_enabled = True
+        self.plugin._allow_unlock = True
+        self.plugin._max_unlock_points = 0
+        self.plugin._offline_staging_path = "/离线中转"
+        self.plugin._offline_tasks = {}
+        self.plugin._windows = {}
+        self.plugin._released = {}
+        self.plugin._persist = lambda: None
+
+    def _juying_item(self, **extra):
+        item = {
+            "title": "疯狂舞蹈办公室[中文字幕].Mad.Dance.Office.2026.1080p.WEB-DL",
+            "resource_type": "magnet",
+            "url": "",
+            "provider_data": {"resource_id": "405799"},
+            "resource_ref": "",
+            "size_bytes": 6324339343,
+        }
+        item.update(extra)
+        return item
+
+    def test_deferred_magnet_kept(self):
+        """url 空、无解锁标记，但有 resource_id 的磁力必须进候选。"""
+        scored = self.plugin._score_candidate("juying", self._juying_item())
+        self.assertIsNotNone(scored, "延迟解析型磁力被丢掉了")
+        self.assertEqual(scored["tier"], csp._OFFLINE_TIER)
+        self.assertEqual(scored["tier_text"], "磁力/电驴离线")
+        self.assertIn("1080P", scored["tags"])
+
+    def test_blank_shell_still_dropped(self):
+        """既没链接也没标识符的空壳仍要丢掉。"""
+        item = self._juying_item()
+        item["provider_data"] = {}
+        self.assertIsNone(self.plugin._score_candidate("juying", item))
+
+    def test_share_without_ref_still_dropped(self):
+        """网盘分享类不带 resource_ref 的空壳不许放行。"""
+        item = self._juying_item(resource_type="115", provider_data={})
+        self.assertIsNone(self.plugin._score_candidate("juying", item))
+
+    def test_deferred_off_when_offline_disabled(self):
+        """关掉离线开关后，延迟解析型磁力退回纯 PT，不再进候选。"""
+        self.plugin._offline_enabled = False
+        self.assertIsNone(self.plugin._score_candidate("juying", self._juying_item()))
+
+    def test_resolve_deferred_returns_url(self):
+        """换链接走 can_unlock（聚影是 RESOURCE_RESOLVE）拿到 magnet。"""
+        handler = MagicMock()
+        handler.can_unlock.return_value = True
+        handler.unlock_resource.return_value = (
+            "magnet:?xt=urn:btih:7c64fc7f88ab4a89535e6674c958f9ada507da93"
+        )
+        cloud = MagicMock()
+        cloud._search_handler = handler
+        best = self.plugin._score_candidate("juying", self._juying_item())
+        resolved = self.plugin._resolve_deferred_resource(cloud, best, "疯狂舞蹈办公室")
+        self.assertIsNotNone(resolved)
+        self.assertTrue(resolved["url"].startswith("magnet:?xt=urn:btih:"))
+        self.assertTrue(resolved["is_unlocked"])
+
+    def test_resolve_deferred_without_identifier(self):
+        """没有标识符就不该去换链接（避免白发请求）。"""
+        cloud = MagicMock()
+        best = {"resource": {"resource_type": "magnet", "url": ""}, "title": "x"}
+        self.assertIsNone(self.plugin._resolve_deferred_resource(cloud, best, "x"))
+        cloud._search_handler.unlock_resource.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

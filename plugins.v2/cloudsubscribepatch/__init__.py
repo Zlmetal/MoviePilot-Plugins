@@ -207,7 +207,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.19"
+    plugin_version = "1.1.20"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -1817,6 +1817,18 @@ class CloudSubscribePatch(_PluginBase):
                                     )
                                     continue
                                 resource = claimed
+                            else:
+                                # 延迟解析型（聚影这类渠道列表模式只回资源 ID）：
+                                # 按 ID 换一次真实磁力链接再进离线下载
+                                resolved = self._resolve_deferred_resource(
+                                    cloud, best, name
+                                )
+                                if not resolved:
+                                    failures.append(
+                                        f"{best.get('title')}：没换到离线链接"
+                                    )
+                                    continue
+                                resource = resolved
                         # 磁力/电驴：不交给上游同步链，直接进 115 离线下载，
                         # 先落到本插件的中转目录，由本插件自己轮询、
                         # 下完搬到上游保存目录，再补一条 MP 下载历史。
@@ -2476,6 +2488,32 @@ class CloudSubscribePatch(_PluginBase):
         )
         return resource
 
+    def _resolve_deferred_resource(
+            self, cloud: Any, best: Dict[str, Any], name: str
+    ) -> Optional[Dict[str, Any]]:
+        """把延迟解析型候选（只有资源 ID）换成带真实链接的资源字典。
+
+        聚影这类渠道在列表模式里只回 `resource_id`，链接要等真要转存时
+        再按 ID 换一次；走的是同一条 unlock 链（渠道只有 RESOURCE_RESOLVE
+        能力时，上游 `SearchProvider.unlock` 内部会 fallback 到 resolve）。
+        """
+        resource = dict(best.get("resource") or {})
+        if not resource:
+            return None
+        if not self._deferred_identifier(resource):
+            return None
+        resolved = self._unlock_resource(cloud, best, name, free=False)
+        if not resolved:
+            return None
+        resolved_url = str(resolved.get("url") or "").strip()
+        if not resolved_url:
+            return None
+        logger.info(
+            f"【网盘订阅智能下载补丁】{name} 延迟解析型候选已换到链接："
+            f"{best.get('title')}"
+        )
+        return resolved
+
     def _trigger_pt_search(self, sid: int, name: str) -> None:
         if sid <= 0:
             return
@@ -2550,6 +2588,39 @@ class CloudSubscribePatch(_PluginBase):
                 )
             )
         return scored
+
+    @staticmethod
+    def _deferred_identifier(item: Any) -> str:
+        """取「延迟解析型」候选手里的资源标识（资源 ID / 种子 ID / token）。"""
+        if not isinstance(item, dict):
+            return ""
+        provider_data = item.get("provider_data")
+        if isinstance(provider_data, dict):
+            for field in ("resource_id", "seed_id", "token", "slug"):
+                value = str(provider_data.get(field) or "").strip()
+                if value:
+                    return value
+        return str(item.get("resource_ref") or "").strip()
+
+    def _is_deferred_candidate(self, item: Any) -> bool:
+        """候选是不是「列表模式只给 ID、转存时再换链接」的延迟解析型。
+
+        只对磁力/电驴/种子放行：这类候选最后走的是 115 离线下载，
+        换链接是一次读请求，踩风控的成本远低于网盘分享转存。
+        网盘分享那类仍要求必须带 resource_ref，免得把空壳当候选。
+        """
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("url") or "").strip():
+            return False
+        resource_type = str(item.get("resource_type") or "").strip().lower()
+        if resource_type not in {"magnet", "ed2k", "torrent"}:
+            return False
+        # 关掉离线开关后磁力本来就退回纯 PT，不用再去换链接；
+        # 换链接是渠道的一次读请求，不花积分，所以不看 allow_unlock。
+        if not self._offline_enabled:
+            return False
+        return bool(self._deferred_identifier(item))
 
     def _candidate_tier(self, item: Any) -> float:
         """候选层级：0=直接可用的网盘直链，1=需解锁网盘，2=纯 PT 资源。
@@ -2711,7 +2782,13 @@ class CloudSubscribePatch(_PluginBase):
         # need_unlock=花积分解锁；need_access=免费领取（也要点一次页面才拿到链接）
         unlock = bool(item.get("need_unlock") and has_ref)
         claim = bool(item.get("need_access") and has_ref)
-        if not url and not unlock and not claim:
+        # 延迟解析型：渠道在列表模式下只回资源 ID、不回链接，等真要转存时
+        # 再按 ID 换一次直链。聚影的磁力就是这种——resource_type=magnet、
+        # url 为空、provider_data 里只有 resource_id，need_unlock/need_access
+        # 两个标记都不带。以前这里只认「有 url」「要解锁」「要领取」三种，
+        # 这一类整批被当成空壳丢掉，表现为订阅后搜到 0 个候选、只能退回等 PT。
+        deferred = self._is_deferred_candidate(item)
+        if not url and not unlock and not claim and not deferred:
             return None
         # 未解锁资源：只在允许解锁时才进候选，且不超过积分上限
         if unlock or claim:
