@@ -207,7 +207,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.20"
+    plugin_version = "1.1.21"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -1451,7 +1451,8 @@ class CloudSubscribePatch(_PluginBase):
             title = str(getattr(torrent_info, "title", "") or "")
 
         episodes = sorted(int(e) for e in (getattr(event_data, "episodes", None) or []) if e)
-        media_type = str(getattr(meta, "type", "") or "") or subscribe_info.get("type") or ""
+        raw_type = getattr(meta, "type", None) or subscribe_info.get("type") or ""
+        media_type = str(getattr(raw_type, "value", raw_type) or "")
         season = int(getattr(meta, "begin_season", 0) or subscribe_info.get("season") or 1)
 
         key = str(sid)
@@ -1501,7 +1502,9 @@ class CloudSubscribePatch(_PluginBase):
                 logger.info(
                     f"【网盘订阅智能下载补丁】{window.get('name')} 等待窗口已过期且无网盘候选，放行 PT：{title}"
                 )
-                self._close_window(key)
+                # 放行就得记放行期，否则这条被放过的 PT 资源会在几秒内
+                # 再次触发事件、又开一个窗口拦回去
+                self._mark_released(key)
                 return
 
         # 第一次遇到 → 开窗并拦下
@@ -1838,7 +1841,9 @@ class CloudSubscribePatch(_PluginBase):
                         if not submitted:
                             failures.append(f"{best.get('title')}：{detail}")
                             continue
-                        self._close_window(key)
+                        # 离线任务都提交成功了，PT 那边就没必要再等下去：
+                        # 记一段放行期，否则 PT 一搜到资源又会开新窗口拦回去
+                        self._mark_released(key)
                         if self._notify:
                             self.post_message(
                                 mtype="订阅",
@@ -1890,7 +1895,9 @@ class CloudSubscribePatch(_PluginBase):
                     logger.info(
                         f"【网盘订阅智能下载补丁】{name} 已确认转存：{best.get('title')}"
                     )
-                    self._close_window(key)
+                    # 分享转存走的是上游同步链，它自己会记订阅进度、判完成，
+                    # 这里只补放行期，别重复写一遍进度
+                    self._mark_released(key)
                     if self._notify:
                         self.post_message(
                             mtype="订阅",
@@ -2257,6 +2264,12 @@ class CloudSubscribePatch(_PluginBase):
                 self._record_offline_history(
                     cloud, record, upstream, str(getattr(item, "name", "") or "")
                 )
+            if videos:
+                # 历史补完就把订阅进度也结掉：媒体库里有片却不推进度的话，
+                # MoviePilot 会一直把这个订阅挂在下载中，永远不收尾
+                self._confirm_subscribe_progress(
+                    cloud, int(record.get("sid") or 0), record
+                )
             return (bool(videos), f"文件已在 {upstream}，已补下载历史"
                     if videos else "中转目录里还没有视频文件")
         try:
@@ -2284,6 +2297,9 @@ class CloudSubscribePatch(_PluginBase):
         logger.info(
             f"【网盘订阅智能下载补丁】离线文件已搬到 {upstream}："
             f"{moved_count} 个（{record.get('title')}）"
+        )
+        self._confirm_subscribe_progress(
+            cloud, int(record.get("sid") or 0), record
         )
         return True, f"已移动 {moved_count} 个文件"
 
@@ -2324,6 +2340,93 @@ class CloudSubscribePatch(_PluginBase):
             )
         except Exception as error:
             logger.warning(f"【网盘订阅智能下载补丁】补写下载历史失败：{error}")
+
+    def _confirm_subscribe_progress(
+            self, cloud: Any, sid: int, record: Dict[str, Any],
+            episode: Optional[int] = None
+    ) -> None:
+        """转存成功/离线搬完后，推一次订阅进度并尝试收尾。
+
+        优先复用「网盘订阅助手」自己的完成链（它和上游转存走的是同一套，
+        能顺带写到系统订阅历史）；拿不到上游能力时退回直接写 note，
+        再不行就触发一次 MP 自己的订阅搜索，让它照常判定媒体库是否已有。
+        """
+        sid = int(sid or 0)
+        if sid <= 0:
+            return
+        subscribe = self._get_subscribe(sid)
+        if not subscribe:
+            logger.debug(
+                f"【网盘订阅智能下载补丁】订阅 {sid} 已不存在，跳过完成判定"
+            )
+            return
+        # 老记录里 media_type 可能是 "MediaType.UNKNOWN" 这类枚举字符串，
+        # 认不出来就退回订阅自己的类型，别拿 None 去识别媒体
+        media_type = (
+            self._media_type(record.get("media_type"))
+            or self._media_type(getattr(subscribe, "type", None))
+        )
+        if media_type is None:
+            logger.debug(
+                f"【网盘订阅智能下载补丁】订阅 {sid} 认不出媒体类型，跳过进度回写"
+            )
+            return
+        handler = getattr(cloud, "_sync_handler", None)
+        sub_handler = getattr(handler, "_subscribe_handler", None) if handler else None
+        finisher = getattr(sub_handler, "check_and_finish_subscribe", None)
+        mediainfo = None
+        if handler is not None:
+            try:
+                mediainfo = handler._subscribe_mediainfo(subscribe, media_type)
+            except Exception as error:
+                logger.debug(f"【网盘订阅智能下载补丁】取媒体信息失败：{error}")
+        episodes: List[int] = []
+        if episode:
+            episodes = [int(episode)]
+        elif isinstance(record.get("episodes"), (list, tuple, set)):
+            episodes = [
+                int(item) for item in record.get("episodes")
+                if str(item).isdigit() and int(item) > 0
+            ]
+        if not episodes:
+            if media_type == MediaType.TV:
+                # 剧集拿不准这次到底落了哪几集就别乱写进度，
+                # 写错会把没下全的订阅直接判完成
+                logger.debug(
+                    f"【网盘订阅智能下载补丁】订阅 {sid} 不知道具体集数，跳过进度回写"
+                )
+                return
+            episodes = [1]
+        if callable(finisher) and mediainfo:
+            try:
+                remaining = finisher(
+                    subscribe=subscribe, mediainfo=mediainfo,
+                    success_episodes=list(episodes),
+                )
+                logger.info(
+                    f"【网盘订阅智能下载补丁】{getattr(subscribe, 'name', sid)} "
+                    f"订阅进度已更新（剩余缺集 {remaining}）"
+                )
+                return
+            except Exception as error:
+                logger.warning(
+                    f"【网盘订阅智能下载补丁】推订阅进度失败，退回写 note：{error}"
+                )
+        # 退回方案：直接把进度写进 note，让 MP 的完成判定能看得到
+        try:
+            current = {
+                int(item) for item in (getattr(subscribe, "note", None) or [])
+                if str(item).isdigit()
+            }
+            merged = sorted(current | {int(item) for item in episodes})
+            if merged != sorted(current):
+                SubscribeOper().update(sid, {"note": merged})
+                logger.info(
+                    f"【网盘订阅智能下载补丁】{getattr(subscribe, 'name', sid)} "
+                    f"已补写订阅进度：{merged}"
+                )
+        except Exception as error:
+            logger.warning(f"【网盘订阅智能下载补丁】写订阅进度失败：{error}")
 
     def _reschedule_offline(
             self, key: str, record: Dict[str, Any], now: Optional[float]
