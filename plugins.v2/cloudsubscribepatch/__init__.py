@@ -49,6 +49,7 @@ pansou 这类聚合源给的都是别人的第三方分享，等待期内经常�
 两个插件任一未启用时本插件自动放行，不做任何拦截。
 """
 
+import base64
 import hashlib
 import re
 import threading
@@ -89,6 +90,12 @@ _SUBMIT_STALE_SECONDS = 2 * 60 * 60
 # 订阅刚添加时的一次性即时检索（不等 PT 首发、也不占等待窗口）。
 # 事件里可能同时收到同步与异步两次广播，用这个窗口做幂等。
 _INSTANT_DEDUP_SECONDS = 10 * 60
+
+# 批量订阅闸：一次加十几部片时，每次「取链接 + 转存」都是 115 的写请求，
+# 几秒内连发十几条会直接踩风控冷却（整个账号一小时不能用）。
+# 所以同一时刻只放行 N 条转存，其余排队，两条之间再间隔 M 秒。
+_INSTANT_GATE_RETRY_SECONDS = 30   # 没轮到槽位时，多久后再试一次
+_GATE_MAX_WAIT_SECONDS = 30 * 60   # 排队最多等这么久，超时放弃（不影响订阅本身）
 
 # 链接寿命：pansou 这类聚合源给的都是别人转发的第三方分享，24 小时内
 # 常被取消；dian115 解锁出来的链接、平台自有链接要持久得多。
@@ -200,7 +207,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.17"
+    plugin_version = "1.1.19"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -225,6 +232,9 @@ class CloudSubscribePatch(_PluginBase):
     _dry_run: bool = False
     _prefer_stable_links: bool = True
     _instant_search: bool = True
+    # 批量订阅闸：同一时刻最多几条即时转存在跑，两条之间隔几秒
+    _instant_max_concurrent: int = 1
+    _instant_gate_interval: int = 20
     # 磁力/电驴离线：离线任务先落到自建中转目录，下完再由本插件搬到上游保存目录
     _offline_enabled: bool = True
     _offline_staging_path: str = ""
@@ -245,6 +255,12 @@ class CloudSubscribePatch(_PluginBase):
         self._instant_tasks: Dict[str, Dict[str, Any]] = {}
         # 在等的离线任务：pending_key -> 任务上下文（重启后从持久化恢复）
         self._offline_tasks: Dict[str, Dict[str, Any]] = {}
+        # 批量订阅闸的运行时状态（只存内存）：
+        # _gate_holders 是当前占着槽位的订阅，_gate_last_finish 是最近一条释放的时刻
+        self._gate_condition = threading.Condition()
+        self._gate_holders: Dict[str, float] = {}
+        self._gate_last_finish: float = 0.0
+        self._gate_stopped: bool = False
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -275,6 +291,16 @@ class CloudSubscribePatch(_PluginBase):
         )
         self._prefer_stable_links = bool(config.get("prefer_stable_links", True))
         self._instant_search = bool(config.get("instant_search", True))
+        # 重载插件时把闸复位，别把上一轮的停止标记留着
+        self._gate_stopped = False
+        self._gate_holders.clear()
+        self._gate_last_finish = 0.0
+        self._instant_max_concurrent = max(
+            1, min(5, self._as_int(config.get("instant_max_concurrent"), 1))
+        )
+        self._instant_gate_interval = max(
+            0, min(600, self._as_int(config.get("instant_gate_interval"), 20))
+        )
         self._offline_enabled = bool(config.get("offline_enabled", True))
         self._offline_staging_path = str(
             config.get("offline_staging_path") or ""
@@ -320,6 +346,10 @@ class CloudSubscribePatch(_PluginBase):
 
     def stop_service(self):
         """插件停用/重载时由框架调用。"""
+        # 叫醒还在等批量闸槽位的线程，让它们尽快退出而不是干等 30 分钟
+        with self._gate_condition:
+            self._gate_stopped = True
+            self._gate_condition.notify_all()
         logger.debug("【网盘订阅智能下载补丁】服务停止")
 
     # ------------------------------------------------------------------
@@ -601,6 +631,68 @@ class CloudSubscribePatch(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "批量订阅闸：一次加十几部片时，每部片都要「取链接 + 转存」，"
+                                                    "几秒内连发十几条写请求会直接把 115 账号打进一小时冷却。"
+                                                    "这两个值决定同一时刻最多放行几条、两条之间隔多久，其余按到达顺序排队。",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "instant_max_concurrent",
+                                            "label": "同时转存条数",
+                                            "placeholder": "1",
+                                            "type": "number",
+                                            "hint": "同一时刻最多几条在转存。默认 1 最稳；"
+                                                    "想快一点可以调到 2，再高就容易踩风控",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "instant_gate_interval",
+                                            "label": "两条之间间隔（秒）",
+                                            "placeholder": "20",
+                                            "type": "number",
+                                            "hint": "上一条转存结束到下一次开始至少隔这么多秒。默认 20 秒，"
+                                                    "批量订阅时能明显减少瞬时请求数",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
@@ -685,6 +777,8 @@ class CloudSubscribePatch(_PluginBase):
             "max_unlock_points": 0,
             "prefer_stable_links": True,
             "instant_search": True,
+            "instant_max_concurrent": 1,
+            "instant_gate_interval": 20,
             "offline_enabled": True,
             "offline_staging_path": "",
         }
@@ -771,6 +865,14 @@ class CloudSubscribePatch(_PluginBase):
                 "summary": "查看事件订阅状态",
                 "description": "返回本插件关注的广播事件在事件总线里的注册与启停状态",
             },
+            {
+                "path": "/offline_check",
+                "endpoint": self._api_offline_check,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "立即检查一次离线任务",
+                "description": "不等巡检周期，马上核对在等的离线任务并尝试搬运已完成的文件",
+            },
         ]
 
     def _api_status(self) -> dict:
@@ -783,6 +885,10 @@ class CloudSubscribePatch(_PluginBase):
                     "wait_hours": self._wait_hours,
                     "prefer_stable_links": self._prefer_stable_links,
                     "instant_search": self._instant_search,
+                    "instant_max_concurrent": self._instant_max_concurrent,
+                    "instant_gate_interval": self._instant_gate_interval,
+                    "gate_holders": sorted(self._gate_holders),
+                    "upstream": self._upstream_state(),
                     "offline_enabled": self._offline_enabled,
                     "offline_staging_path": self._offline_staging_path,
                     "offline_tasks": list(self._offline_tasks.values()),
@@ -790,6 +896,42 @@ class CloudSubscribePatch(_PluginBase):
                     "windows": list(self._windows.values()),
                 },
             }
+
+    def _api_offline_check(self) -> dict:
+        """立刻跑一轮离线任务检查，便于下完当场验证搬运是否成功。"""
+        cloud = self._cloud_plugin()
+        if not cloud:
+            return {"success": False, "message": "网盘订阅助手未运行"}
+        with self._lock:
+            pending = [
+                (key, dict(value))
+                for key, value in self._offline_tasks.items()
+            ]
+        results: List[Dict[str, Any]] = []
+        for key, record in pending:
+            before = dict(record)
+            try:
+                self._check_offline_task(cloud, key, record)
+            except Exception as error:
+                results.append({
+                    "key": key,
+                    "title": before.get("title"),
+                    "error": str(error)[:200],
+                })
+                continue
+            with self._lock:
+                after = self._offline_tasks.get(key)
+            results.append({
+                "key": key,
+                "title": before.get("title"),
+                "hash": before.get("hash"),
+                "still_pending": after is not None,
+                "checks_after": (after or {}).get("checks"),
+            })
+        return {
+            "success": True,
+            "data": {"checked": len(pending), "results": results},
+        }
 
     def _api_offline_probe(self) -> dict:
         """自测离线链路接线：四个能力对象是否都拿得到、路径对不对。"""
@@ -994,6 +1136,100 @@ class CloudSubscribePatch(_PluginBase):
             self._event_trace.append(row)
             if len(self._event_trace) > 40:
                 del self._event_trace[: len(self._event_trace) - 40]
+
+    # ------------------------------------------------------------------
+    # 批量订阅闸
+    # ------------------------------------------------------------------
+    def _acquire_gate(self, key: str) -> bool:
+        """向批量闸要一个转存槽位；等不到（超时）返回 False。
+
+        115 的写请求有 QPS 与冷却限制，一次加十几部片同时「取链接 + 转存」
+        会直接把整个账号打进一小时冷却。这里把转存串起来：同一时刻最多
+        `_instant_max_concurrent` 条在跑，两条之间至少隔 `_instant_gate_interval` 秒，
+        其余的按到达顺序排队，最多等 `_GATE_MAX_WAIT_SECONDS`。
+        """
+        deadline = time.time() + _GATE_MAX_WAIT_SECONDS
+        with self._gate_condition:
+            while True:
+                if self._gate_stopped:
+                    return False
+                now = time.time()
+                limit = max(1, int(self._instant_max_concurrent or 1))
+                gap = max(0, int(self._instant_gate_interval or 0))
+                idle = (not self._gate_last_finish) or (
+                    now - self._gate_last_finish >= gap
+                )
+                if len(self._gate_holders) < limit and idle:
+                    self._gate_holders[key] = now
+                    return True
+                if now >= deadline:
+                    return False
+                wait = min(
+                    float(_INSTANT_GATE_RETRY_SECONDS),
+                    max(0.5, deadline - now),
+                )
+                self._gate_condition.wait(timeout=wait)
+
+    def _release_gate(self, key: str) -> None:
+        """交还槽位并唤醒排队中的订阅。"""
+        with self._gate_condition:
+            if self._gate_holders.pop(key, None) is not None:
+                self._gate_last_finish = time.time()
+            self._gate_condition.notify_all()
+
+    def _upstream_state(self) -> Dict[str, Any]:
+        """上游接管状态快照，供 /status 回读。
+
+        让位分支到底为什么走或没走，光看日志很难分辨：是上游没开
+        `takeover_new_subscribes`，还是接管时段没命中，抑或上游根本没运行。
+        把判断的原料整个吐出来，一次就能对上。
+        """
+        cloud = self._cloud_plugin()
+        if not cloud:
+            return {"running": False}
+        takes = bool(getattr(cloud, "_takeover_new_subscribes", False))
+        take_over = getattr(cloud, "_is_takeover_active", None)
+        active: Any = None
+        if callable(take_over):
+            try:
+                active = bool(take_over())
+            except Exception as error:
+                active = f"error:{error}"
+        return {
+            "running": True,
+            "takeover_new_subscribes": takes,
+            "takeover_active": active,
+            "block_system_subscribe": bool(
+                getattr(cloud, "_block_system_subscribe", False)
+            ),
+            "block_window": (
+                f"{getattr(cloud, '_block_start_time', '')}"
+                f"-{getattr(cloud, '_block_end_time', '')}"
+            ),
+        }
+
+    def _upstream_handles_new_subscribes(self, cloud: Any) -> bool:
+        """上游助手会不会自己搜这条新订阅（会搜就别让本插件再转一份）。
+
+        「网盘订阅助手」收到订阅新增事件后自己也会入队一次即时搜索
+        （`on_subscribe_added` → `queue_subscribe_search`），两条链路互不知情，
+        同一条订阅就会被转存两份——这正是聚影与 Dian115 各转一个的成因。
+        上游开着 `takeover_new_subscribes` 且接管生效时，把分享类候选
+        让给它，本插件只独占它做得不好的磁力/电驴离线。
+        """
+        takes = bool(getattr(cloud, "_takeover_new_subscribes", False))
+        active: Any = None
+        take_over = getattr(cloud, "_is_takeover_active", None)
+        if callable(take_over):
+            try:
+                active = bool(take_over())
+            except Exception as error:
+                active = f"error:{error}"
+        result = bool(takes and (active is True if active is not None else True))
+        # 让位与否直接影响会不会重复转存，把这个判断的原料一起记下来，
+        # 出问题时 /status 一眼能看出是上游没开接管还是接管时段没命中。
+        self._trace("upstream_check", takes=takes, active=active, result=result)
+        return result
 
     def _handle_subscribe_added(self, sid: int) -> None:
         cloud = self._cloud_plugin()
@@ -1333,6 +1569,17 @@ class CloudSubscribePatch(_PluginBase):
                 window = self._windows.get(key)
             if not window:
                 continue
+            # 订阅本身已被删掉（测试或取消），窗口就不用再等下去了
+            try:
+                if not self._get_subscribe(int(window.get("sid") or 0)):
+                    logger.info(
+                        f"【网盘订阅智能下载补丁】{window.get('name')} 订阅已不存在，"
+                        f"清掉等待窗口"
+                    )
+                    self._close_window(key)
+                    continue
+            except Exception:
+                pass
             try:
                 if now >= float(window.get("expire_at") or 0):
                     self._finalize(window, cloud)
@@ -1474,6 +1721,43 @@ class CloudSubscribePatch(_PluginBase):
         service = self._share_transfer_service(cloud)
         # 每条候选到底为什么没成，最后要原样告诉用户，别只剩「转存 0 个文件」
         failures: List[str] = []
+        upstream_takes = self._upstream_handles_new_subscribes(cloud)
+        # 上游助手自己也会为这条新订阅搜一次网盘（on_subscribe_added →
+        # queue_subscribe_search），两条链路互相不知情，同一部片就会被转两份——
+        # 这正是「聚影和 Dian115 各转一个」的成因。上游会接管时，分享类候选整个
+        # 让给它，本插件只保留它做不了的磁力/电驴离线（它有离线分支但不写下载历史、
+        # 也不会搬到中转目录）。
+        if instant and upstream_takes:
+            # 本轮有没有「分享类」候选（直链/需解锁网盘）。有就整轮交出去——
+            # 上游本来就会搜到同一份并转存，本插件再动一次就是两份。
+            # 只有当候选里一个分享类都没有、只剩磁力/电驴时，才轮到本插件干活。
+            share_tiers = []
+            for item in ranked:
+                tier_value = item.get("tier")
+                if tier_value is None:
+                    tier_value = self._candidate_tier(dict(item.get("resource") or {}))
+                share_tiers.append(float(tier_value))
+            has_share = any(t < _OFFLINE_TIER for t in share_tiers)
+            offline_only = [] if has_share else [
+                item for item, t in zip(ranked, share_tiers) if t == _OFFLINE_TIER
+            ]
+            self._trace(
+                "yield_plan", sid=sid, tiers=share_tiers,
+                has_share=has_share, offline=len(offline_only),
+            )
+            if not offline_only:
+                logger.info(
+                    f"【网盘订阅智能下载补丁】{name} 本轮有网盘分享候选，"
+                    f"整轮交给网盘订阅助手自己转存，本插件不重复转存"
+                )
+                self._trace("instant_skip_upstream", sid=sid, name=name)
+                self._close_window(key)
+                return
+            logger.info(
+                f"【网盘订阅智能下载补丁】{name} 分享类交给网盘订阅助手，"
+                f"本插件只处理 {len(offline_only)} 个磁力/电驴候选"
+            )
+            ranked = offline_only
         try:
             for index, best in enumerate(ranked):
                 resource = dict(best.get("resource") or {})
@@ -1498,22 +1782,108 @@ class CloudSubscribePatch(_PluginBase):
                         f"（{best.get('tier_text') or 'PT'}），保留 PT 直下更省事"
                     )
                     continue
-                if float(tier) == _OFFLINE_TIER:
-                    # 磁力/电驴：不交给上游同步链，直接进 115 离线下载，
-                    # 先落到本插件的中转目录，由本插件自己轮询、
-                    # 下完搬到上游保存目录，再补一条 MP 下载历史。
-                    submitted, detail = self._submit_offline(
-                        cloud, sid, window, best, resource, name
+                # 批量闸：每条「取链接 + 转存」都是 115 的写请求，
+                # 短时间连发十几条会直接踩风控冷却（整个账号一小时不能用），
+                # 所以按队列拿槽位，拿不到就本轮跳过。
+                gate_key = f"{key}:{index}"
+                if not self._acquire_gate(gate_key):
+                    logger.warning(
+                        f"【网盘订阅智能下载补丁】{name} 排队等转存槽位超时，本轮跳过"
                     )
-                    if not submitted:
+                    failures.append(f"{best.get('title')}：排队等转存槽位超时")
+                    continue
+                try:
+                    if float(tier) == _OFFLINE_TIER:
+                        # 磁力/电驴候选常常也挂在需解锁的网盘渠道下：dian115 给的
+                        # 是 edk2 链接但要先花积分解锁才拿得到，url 这时还是空的。
+                        # 不先解锁，`_submit_offline` 只会看到「候选没有离线链接」
+                        # 直接判失败——原版就是这样把磁力渠道白白错过的。
+                        if not str(resource.get("url") or "").strip():
+                            if best.get("need_unlock"):
+                                unlocked = self._unlock_resource(
+                                    cloud, best, name, free=False
+                                )
+                                if not unlocked:
+                                    failures.append(
+                                        f"{best.get('title')}：解锁未拿到离线链接"
+                                    )
+                                    continue
+                                resource = unlocked
+                            elif best.get("need_access"):
+                                claimed = self._claim_free_resource(cloud, best, name)
+                                if not claimed:
+                                    failures.append(
+                                        f"{best.get('title')}：领取未拿到离线链接"
+                                    )
+                                    continue
+                                resource = claimed
+                        # 磁力/电驴：不交给上游同步链，直接进 115 离线下载，
+                        # 先落到本插件的中转目录，由本插件自己轮询、
+                        # 下完搬到上游保存目录，再补一条 MP 下载历史。
+                        submitted, detail = self._submit_offline(
+                            cloud, sid, window, best, resource, name
+                        )
+                        if not submitted:
+                            failures.append(f"{best.get('title')}：{detail}")
+                            continue
+                        self._close_window(key)
+                        if self._notify:
+                            self.post_message(
+                                mtype="订阅",
+                                title=("【智能下载】订阅新增，已提交网盘离线下载"
+                                       if instant else "【智能下载】已提交网盘离线下载"),
+                                text=(
+                                    f"{name}\n"
+                                    f"资源：{best.get('title')}\n"
+                                    f"来源：{best.get('source') or '网盘'}"
+                                    f"（{best.get('tier_text') or ''}）\n"
+                                    f"评分：{best.get('score')}\n"
+                                    f"文件大小：{best.get('size_text') or '未知'}\n"
+                                    f"状态：{detail}"
+                                ),
+                            )
+                        return
+                    # 只有当它真排到前面、马上要提交了，才花积分/领链接；
+                    # 搜索与比价阶段全程不解锁。
+                    if best.get("need_unlock"):
+                        logger.info(
+                            f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名需解锁"
+                            f"（{best.get('unlock_points') or 0} 积分），确认采用后才解锁："
+                            f"{best.get('title')}"
+                        )
+                        unlocked = self._unlock_resource(cloud, best, name, free=False)
+                        if not unlocked:
+                            failures.append(f"{best.get('title')}：解锁未拿到链接")
+                            continue
+                        resource = unlocked
+                    elif best.get("need_access"):
+                        logger.info(
+                            f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名免费待领取，"
+                            f"开始获取链接：{best.get('title')}"
+                        )
+                        # 免费待领取的候选得先在这里领一次，把 url 补上再交出去
+                        claimed = self._claim_free_resource(cloud, best, name)
+                        if not claimed:
+                            failures.append(f"{best.get('title')}：领取未拿到链接")
+                            continue
+                        resource = claimed
+                    success, detail = self._transfer_and_confirm(cloud, sid, resource, name)
+                    if not success:
+                        logger.warning(
+                            f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名转存未成功"
+                            f"（{detail}），顺位下一个：{best.get('title')}"
+                        )
                         failures.append(f"{best.get('title')}：{detail}")
                         continue
+                    logger.info(
+                        f"【网盘订阅智能下载补丁】{name} 已确认转存：{best.get('title')}"
+                    )
                     self._close_window(key)
                     if self._notify:
                         self.post_message(
                             mtype="订阅",
-                            title=("【智能下载】订阅新增，已提交网盘离线下载"
-                                   if instant else "【智能下载】已提交网盘离线下载"),
+                            title=("【智能下载】订阅新增，已有网盘资源，已直接转存"
+                                   if instant else "【智能下载】已选用网盘资源"),
                             text=(
                                 f"{name}\n"
                                 f"资源：{best.get('title')}\n"
@@ -1521,62 +1891,12 @@ class CloudSubscribePatch(_PluginBase):
                                 f"（{best.get('tier_text') or ''}）\n"
                                 f"评分：{best.get('score')}\n"
                                 f"文件大小：{best.get('size_text') or '未知'}\n"
-                                f"状态：{detail}"
+                                f"状态：{detail or '已转存'}"
                             ),
                         )
                     return
-                # 只有当它真排到前面、马上要提交了，才花积分/领链接；
-                # 搜索与比价阶段全程不解锁。
-                if best.get("need_unlock"):
-                    logger.info(
-                        f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名需解锁"
-                        f"（{best.get('unlock_points') or 0} 积分），确认采用后才解锁："
-                        f"{best.get('title')}"
-                    )
-                    unlocked = self._unlock_resource(cloud, best, name, free=False)
-                    if not unlocked:
-                        failures.append(f"{best.get('title')}：解锁未拿到链接")
-                        continue
-                    resource = unlocked
-                elif best.get("need_access"):
-                    logger.info(
-                        f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名免费待领取，"
-                        f"开始获取链接：{best.get('title')}"
-                    )
-                    # 免费待领取的候选得先在这里领一次，把 url 补上再交出去
-                    claimed = self._claim_free_resource(cloud, best, name)
-                    if not claimed:
-                        failures.append(f"{best.get('title')}：领取未拿到链接")
-                        continue
-                    resource = claimed
-                success, detail = self._transfer_and_confirm(cloud, sid, resource, name)
-                if not success:
-                    logger.warning(
-                        f"【网盘订阅智能下载补丁】{name} 第 {index + 1} 名转存未成功"
-                        f"（{detail}），顺位下一个：{best.get('title')}"
-                    )
-                    failures.append(f"{best.get('title')}：{detail}")
-                    continue
-                logger.info(
-                    f"【网盘订阅智能下载补丁】{name} 已确认转存：{best.get('title')}"
-                )
-                self._close_window(key)
-                if self._notify:
-                    self.post_message(
-                        mtype="订阅",
-                        title=("【智能下载】订阅新增，已有网盘资源，已直接转存"
-                               if instant else "【智能下载】已选用网盘资源"),
-                        text=(
-                            f"{name}\n"
-                            f"资源：{best.get('title')}\n"
-                            f"来源：{best.get('source') or '网盘'}"
-                            f"（{best.get('tier_text') or ''}）\n"
-                            f"评分：{best.get('score')}\n"
-                            f"文件大小：{best.get('size_text') or '未知'}\n"
-                            f"状态：{detail or '已转存'}"
-                        ),
-                    )
-                return
+                finally:
+                    self._release_gate(gate_key)
             self._all_candidates_failed(key, name, sid, failures, instant=instant)
         except Exception as error:
             logger.error(f"【网盘订阅智能下载补丁】{name} 提交线程异常：{error}")
@@ -1652,26 +1972,56 @@ class CloudSubscribePatch(_PluginBase):
 
     @staticmethod
     def _offline_hash(url: str) -> str:
-        """取磁力/电驴链接的 info_hash，统一 32/40 位大写十六进制。"""
+        """取磁力/电驴链接的 info_hash，统一大写十六进制。
+
+        115 的离线任务 id 就是这里的哈希：ed2k 取链接里那一段文件哈希
+        （`ed2k://|file|名字|大小|<32位哈希>|`），磁力取 btih。
+        早先误用了不存在的 `P115OfflineDownload`，异常后整段回退到
+        `extract_magnet_hash`，把 ed2k 的 32 位哈希当 base32 解码成另一个值，
+        于是任务永远对不上号、离线文件永远搬不动——务必按链接类型分开算。
+        """
         raw = str(url or "").strip()
         if not raw:
             return ""
+        is_ed2k = raw.lower().startswith("ed2k://")
         try:
-            from app.plugins.cloudsubscribe.drive.p115.offline import P115OfflineDownload
+            from app.plugins.cloudsubscribe.drive.p115.offline import (
+                OfflineDownloadService,
+            )
             info = (
-                P115OfflineDownload.parse_ed2k_link(raw)
-                if raw.lower().startswith("ed2k://")
-                else P115OfflineDownload.parse_magnet_link(raw)
+                OfflineDownloadService.parse_ed2k_link(raw)
+                if is_ed2k else OfflineDownloadService.parse_magnet_link(raw)
             )
             if info and info.get("hash"):
                 return str(info["hash"]).upper()
         except Exception:
             pass
+        if is_ed2k:
+            # 回退：ed2k 链接第 5 段是文件哈希（1 起算：ed2k / file / 名字 / 大小 / 哈希 / ...）
+            parts = raw.replace("｜", "|").split("|")
+            if len(parts) >= 5 and re.fullmatch(r"[0-9A-Fa-f]{32}", parts[4].strip()):
+                return parts[4].strip().upper()
+            return ""
         try:
             from app.plugins.cloudsubscribe.utils.magnet import extract_magnet_hash
-            return str(extract_magnet_hash(raw) or "").upper()
+            hashed = str(extract_magnet_hash(raw) or "").upper()
+            if hashed:
+                return hashed
         except Exception:
+            pass
+        # 回退：直接抓 btih（32 位 base32 或 40 位十六进制），不依赖上游导入
+        match = re.search(r"urn:btih:([0-9A-Za-z]+)", raw, re.IGNORECASE)
+        if not match:
             return ""
+        btih = match.group(1).upper()
+        if len(btih) == 40:
+            return btih
+        if len(btih) == 32:
+            try:
+                return base64.b32decode(btih).hex().upper()
+            except Exception:
+                return btih
+        return ""
 
     def _offline_upstream_path(self, cloud: Any) -> str:
         """上游「网盘订阅助手」配置的保存目录（分享转存与离线共用的那个）。"""
@@ -1776,12 +2126,39 @@ class CloudSubscribePatch(_PluginBase):
                 break
         digest = str(record.get("hash") or "").upper()
         task: Dict[str, Any] = {}
+        tasks: List[Dict[str, Any]] = []
         if tasks_service:
             snapshot = tasks_service.get_offline_task_list_snapshot(force=True) or {}
-            for item in snapshot.get("tasks") or []:
-                if str(item.get("id") or "").upper() == digest:
-                    task = dict(item)
-                    break
+            tasks = [dict(item) for item in (snapshot.get("tasks") or [])]
+        for item in tasks:
+            if digest and str(item.get("id") or "").upper() == digest:
+                task = item
+                break
+        if not task:
+            # 哈希对不上时的退路：早先版本的 ed2k 哈希算错过，
+            # 照记录里保存的链接重新算一次，再不行就按文件名精确匹配。
+            recomputed = self._offline_hash(str(record.get("url") or ""))
+            if recomputed and recomputed != digest:
+                for item in tasks:
+                    if str(item.get("id") or "").upper() == recomputed:
+                        task = item
+                        logger.info(
+                            f"【网盘订阅智能下载补丁】离线任务哈希已修正："
+                            f"{digest} → {recomputed}"
+                        )
+                        with self._lock:
+                            current = self._offline_tasks.get(key)
+                            if current is not None:
+                                current["hash"] = recomputed
+                                self._persist()
+                        break
+        if not task:
+            wanted = str(record.get("title") or "").strip()
+            if wanted:
+                for item in tasks:
+                    if str(item.get("name") or "").strip() == wanted:
+                        task = item
+                        break
         title = record.get("title") or record.get("name")
         if not task:
             # 网盘那边还没列出来（刚提交时有延迟），继续等
@@ -2058,6 +2435,10 @@ class CloudSubscribePatch(_PluginBase):
                 logger.warning(
                     f"【网盘订阅智能下载补丁】{name} 渠道 {source} 不支持{label}，跳过"
                 )
+                self._trace(
+                    "unlock_skip", name=name[:30], source=source,
+                    reason="can_unlock=False", title=str(best.get("title") or "")[:50],
+                )
                 return None
             unlocked = search_handler.unlock_resource(
                 source, resource, search_label=f"智能下载补丁·{name}"
@@ -2065,6 +2446,10 @@ class CloudSubscribePatch(_PluginBase):
         except Exception as error:
             logger.error(
                 f"【网盘订阅智能下载补丁】{name} {label}资源失败：{error}"
+            )
+            self._trace(
+                "unlock_error", name=name[:30], source=source,
+                error=str(error)[:120], title=str(best.get("title") or "")[:50],
             )
             return None
         url = ""
@@ -2075,6 +2460,11 @@ class CloudSubscribePatch(_PluginBase):
         if not url:
             logger.warning(
                 f"【网盘订阅智能下载补丁】{name} {label}未拿到链接：{best.get('title')}"
+            )
+            self._trace(
+                "unlock_empty", name=name[:30], source=source,
+                result_type=type(unlocked).__name__,
+                title=str(best.get("title") or "")[:50],
             )
             return None
         resource["url"] = url
