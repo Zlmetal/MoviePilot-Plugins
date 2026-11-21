@@ -200,7 +200,7 @@ class CloudSubscribePatch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.16"
+    plugin_version = "1.1.17"
     # 插件作者
     plugin_author = "Zlmetal"
     # 作者主页
@@ -756,6 +756,14 @@ class CloudSubscribePatch(_PluginBase):
                 "auth": "bear",
             },
             {
+                "path": "/offline_probe",
+                "endpoint": self._api_offline_probe,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "自测离线能力接线",
+                "description": "检查上游离线下载/任务/查询/移动能力是否都拿得到，并回显中转与保存目录",
+            },
+            {
                 "path": "/handlers",
                 "endpoint": self._api_handlers,
                 "methods": ["GET"],
@@ -782,6 +790,43 @@ class CloudSubscribePatch(_PluginBase):
                     "windows": list(self._windows.values()),
                 },
             }
+
+    def _api_offline_probe(self) -> dict:
+        """自测离线链路接线：四个能力对象是否都拿得到、路径对不对。"""
+        cloud = self._cloud_plugin()
+        if not cloud:
+            return {"success": False, "message": "未找到「网盘订阅助手」实例"}
+        handler = getattr(cloud, "_sync_handler", None)
+        download = self._offline_download_service(cloud)
+        tasks = getattr(handler, "_offline_tasks", None) if handler else None
+        query = getattr(handler, "_cloud_query", None) if handler else None
+        mutations = getattr(handler, "_cloud_mutations", None) if handler else None
+        upstream = self._offline_upstream_path(cloud)
+        return {
+            "success": True,
+            "data": {
+                "offline_enabled": self._offline_enabled,
+                "staging_path": self._offline_staging_path or upstream,
+                "staging_configured": bool(self._offline_staging_path),
+                "upstream_path": upstream,
+                "capabilities": {
+                    "offline_download": bool(download),
+                    "offline_tasks": bool(
+                        tasks and callable(getattr(tasks, "get_offline_task_list_snapshot", None))
+                    ),
+                    "file_query": bool(
+                        query and callable(getattr(query, "list_offline_task_files", None))
+                    ),
+                    "file_mutation": bool(
+                        mutations and callable(getattr(mutations, "move_file", None))
+                    ),
+                    "history_record": bool(
+                        callable(getattr(handler, "_record_download_history", None))
+                    ),
+                },
+                "pending_tasks": len(self._offline_tasks),
+            },
+        }
 
     def _api_check_now(self) -> dict:
         self._monitor_once()
